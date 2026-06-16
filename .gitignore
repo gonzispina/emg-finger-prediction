@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+.env
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Datos (grandes, sin sentido versionar — se reconstruyen capturando)
+data/
+ads_emg_log.csv
+data_for_cleaning*.csv
+*.npz
+
+# Modelos entrenados
+checkpoints/
+
+# Plots / outputs intermedios
+plots/
+
+# IDE / OS
+.DS_Store
+.vscode/
+.idea/
+
+# PlatformIO build
+sketchs/esp32/.pio/
+sketchs/esp32/.pioenvs/
+sketchs/esp32/.piolibdeps/
