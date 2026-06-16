@@ -17,7 +17,7 @@ static const int PIN_JOY_A = 5;
 static const int PIN_JOY_B = 6;
 
 SPIClass spiADS(HSPI);
-static const uint32_t SPI_HZ = 100000;
+static const uint32_t SPI_HZ = 1920000;   // 1.92 MHz (max spec del ADS1256 = fclkin/4)
 
 static const uint8_t CMD_WAKEUP  = 0x00;
 static const uint8_t CMD_RDATA   = 0x01;
@@ -38,7 +38,7 @@ void adsCommand(uint8_t cmd) {
   csLow();
   spiADS.transfer(cmd);
   csHigh();
-  delayMicroseconds(10);
+  // sin delay post-CS — el siguiente CS LOW da margen de por si
 }
 
 void adsWriteReg(uint8_t reg, uint8_t val) {
@@ -47,17 +47,15 @@ void adsWriteReg(uint8_t reg, uint8_t val) {
   spiADS.transfer(0x00);
   spiADS.transfer(val);
   csHigh();
-  delayMicroseconds(10);
 }
 
 uint8_t adsReadReg(uint8_t reg) {
   csLow();
   spiADS.transfer(0x10 | reg);
   spiADS.transfer(0x00);
-  delayMicroseconds(10);
+  delayMicroseconds(10);            // t6 spec antes del read
   uint8_t v = spiADS.transfer(0xFF);
   csHigh();
-  delayMicroseconds(10);
   return v;
 }
 
@@ -69,20 +67,30 @@ bool waitDrdy(uint32_t timeout_us = 10000) {
   return true;
 }
 
-void setSingleEndedAIN0() {
-  // AIN0 - AINCOM/GND
-  adsWriteReg(REG_MUX, 0x08);
+// Switch al canal y gain indicados. ADCON: PGA gain bits 2:0.
+//   gain 1 = 0x00 (00 = no clock out, 00 = no sensor detect, 000 = PGA 1)
+//   gain 2 = 0x01,  gain 4 = 0x02,  gain 8 = 0x03,
+//   gain 16 = 0x04, gain 32 = 0x05, gain 64 = 0x06.
+// delay 4us = t11 spec (24 t_CLKIN).
+void switchChannel(uint8_t muxValue, uint8_t adconValue) {
+  adsWriteReg(REG_ADCON, adconValue);
+  adsWriteReg(REG_MUX, muxValue);
   adsCommand(CMD_SYNC);
-  delayMicroseconds(10);
+  delayMicroseconds(4);
   adsCommand(CMD_WAKEUP);
 }
+// Todos los canales con gain=1 (ADCON=0x00).
+void setSingleEndedAIN0() { switchChannel(0x08, 0x00); }   // ext_ind
+void setSingleEndedAIN2() { switchChannel(0x28, 0x00); }   // flx_ind
+void setSingleEndedAIN4() { switchChannel(0x48, 0x00); }   // ext_med
+void setSingleEndedAIN6() { switchChannel(0x68, 0x00); }   // flx_med
 
 int32_t adsReadData24() {
   if (!waitDrdy()) return INT32_MIN;
 
   csLow();
   spiADS.transfer(CMD_RDATA);
-  delayMicroseconds(10);
+  delayMicroseconds(7);                 // t6 spec (50 t_CLKIN @ 7.68 MHz)
 
   uint8_t b2 = spiADS.transfer(0xFF);
   uint8_t b1 = spiADS.transfer(0xFF);
@@ -108,8 +116,24 @@ uint8_t crc8(const uint8_t* data, size_t len) {
 
 uint8_t frame[FRAME_SIZE];
 
+// ---------- Dual-core: serial output corre en core 0 ----------
+// Core 0: serialTask consume la queue y hace Serial.write
+// Core 1 (default Arduino loop): lee ADS + joys + push a queue
+// Esto desacopla el costo de Serial.write del loop de muestreo.
+static QueueHandle_t g_frame_queue;
+static const int QUEUE_CAPACITY = 128;     // ~64ms de buffering a 2kHz
+
+void serialTask(void* params) {
+  uint8_t buf[FRAME_SIZE];
+  for (;;) {
+    if (xQueueReceive(g_frame_queue, buf, portMAX_DELAY) == pdTRUE) {
+      Serial.write(buf, FRAME_SIZE);
+    }
+  }
+}
+
 void setup() {
-  Serial.begin(921600);
+  Serial.begin(2000000);    // 2 Mbps (USB-CDC: baudrate virtual, no UART real)
   delay(2000);
 
   pinMode(PIN_CS, OUTPUT);
@@ -127,10 +151,10 @@ void setup() {
 
   // STATUS 0x00 = buffer OFF
   // ADCON  0x00 = gain 1
-  // DRATE  0xA1 = 1000 SPS
+  // DRATE  0xE0 = 15000 SPS (settling ~67us, mejor SNR que 30 kSPS)
   adsWriteReg(REG_STATUS, 0x00);
   adsWriteReg(REG_ADCON,  0x00);
-  adsWriteReg(REG_DRATE,  0xA1);
+  adsWriteReg(REG_DRATE,  0xE0);
 
   adsCommand(CMD_SELFCAL);
   waitDrdy(50000);
@@ -140,7 +164,19 @@ void setup() {
 
   analogReadResolution(12);
 
-  Serial.println("# SINGLE-ENDED TEST");
+  Serial.println("# 4-CH SINGLE-ENDED: emg0=AIN0 emg1=AIN2 emg2=AIN4 emg3=AIN6 (vs AINCOM)");
+  Serial.println("# Gains: emg0=1 emg1=1 emg2=1 emg3=1");
+  Serial.println("# Dual-core: ADC en core 1, Serial.write en core 0");
+  Serial.flush();
+
+  // Crear queue de frames y arrancar el task de serial en core 0.
+  g_frame_queue = xQueueCreate(QUEUE_CAPACITY, FRAME_SIZE);
+  xTaskCreatePinnedToCore(
+    serialTask, "serial", 4096, NULL,
+    1,           // prioridad media-baja (no compite con loop)
+    NULL,
+    0            // core 0
+  );
   Serial.print("# STATUS=0x"); Serial.println(adsReadReg(REG_STATUS), HEX);
   Serial.print("# MUX=0x");    Serial.println(adsReadReg(REG_MUX), HEX);
   Serial.print("# ADCON=0x");  Serial.println(adsReadReg(REG_ADCON), HEX);
@@ -153,11 +189,16 @@ void loop() {
   int32_t emg0, emg1, emg2, emg3;
 
   setSingleEndedAIN0();
-
   emg0 = adsReadData24();
-  emg1 = 0;
-  emg2 = 0;
-  emg3 = 0;
+
+  setSingleEndedAIN2();
+  emg1 = adsReadData24();
+
+  setSingleEndedAIN4();
+  emg2 = adsReadData24();
+
+  setSingleEndedAIN6();
+  emg3 = adsReadData24();
 
   uint16_t joy_a = (uint16_t)analogReadRaw(PIN_JOY_A);
   uint16_t joy_b = (uint16_t)analogReadRaw(PIN_JOY_B);
@@ -175,5 +216,8 @@ void loop() {
   memcpy(&frame[24], &joy_b, 2);
   frame[26] = crc8(&frame[2], 24);
 
-  Serial.write(frame, FRAME_SIZE);
+  // Push al queue para que el task de core 0 haga el Serial.write.
+  // Si la queue esta llena, descartamos el frame (mejor que bloquear el
+  // loop de muestreo). Timeout 0 = no block.
+  xQueueSend(g_frame_queue, frame, 0);
 }

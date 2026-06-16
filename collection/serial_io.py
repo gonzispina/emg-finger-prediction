@@ -71,7 +71,7 @@ class SerialReader:
     def __init__(
         self,
         port: str,
-        baud: int = 921600,
+        baud: int = 2000000,
         timeout: float = 0.05,
     ):
         self.ser = serial.Serial(port, baud, timeout=timeout)

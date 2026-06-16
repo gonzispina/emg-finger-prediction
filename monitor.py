@@ -114,7 +114,7 @@ def crc8(data: bytes) -> int:
 class SerialStream(StreamReader):
     """Lee frames binarios del firmware ESP32 por puerto serial."""
 
-    def __init__(self, port: str, baud: int = 921600, timeout: float = 0.01):
+    def __init__(self, port: str, baud: int = 2000000, timeout: float = 0.01):
         import serial
         self.ser = serial.Serial(port, baud, timeout=timeout)
         self.buf = bytearray()
@@ -585,8 +585,8 @@ def main():
     elif args.source == "serial":
         if args.port is None:
             raise SystemExit("--port es obligatorio con --source serial")
-        print(f"Serial stream: port={args.port}, baud=921600")
-        stream = SerialStream(port=args.port, baud=921600)
+        print(f"Serial stream: port={args.port}, baud=2000000")
+        stream = SerialStream(port=args.port, baud=2000000)
     else:
         raise SystemExit(f"unknown source: {args.source}")
 

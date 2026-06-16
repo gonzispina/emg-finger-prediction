@@ -27,7 +27,7 @@ def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--port", required=True)
-    p.add_argument("--baud", type=int, default=921600)
+    p.add_argument("--baud", type=int, default=2000000)
     p.add_argument("--seconds", type=float, required=True,
                    help="duracion de la captura (s)")
     p.add_argument("--out", required=True, type=Path)

@@ -23,7 +23,7 @@ def main():
     p.add_argument("--session", "-n", type=int, help="session_number (1-10)")
     p.add_argument("--placement", "-p", help="placement_id, ej P01-A")
     p.add_argument("--port", default="/dev/cu.usbserial-2110")
-    p.add_argument("--baud", type=int, default=921600)
+    p.add_argument("--baud", type=int, default=2000000)
     p.add_argument("--output-dir", default="data/raw", type=Path)
     p.add_argument("--notes", default="")
     args = p.parse_args()

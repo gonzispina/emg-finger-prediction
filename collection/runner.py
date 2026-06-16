@@ -88,7 +88,7 @@ def run_session(
     session_number: int,
     placement_id: str,
     port: str,
-    baud: int = 921600,
+    baud: int = 2000000,
     output_dir: Path = Path("data/raw"),
     notes: str = "",
     countdown_seconds: int = 3,
