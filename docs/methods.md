@@ -1306,6 +1306,122 @@ El mismo render (cajita + un círculo) se reusa. Cambios necesarios:
 
 ---
 
+## 14. Setup 2-dedos (ESP32+ADS1256) — pipeline y gotchas
+
+A partir de S04 el setup migra a ESP32-S3 + ADS1256 + 4 EXG pills BioAmp para grabar
+2 dedos (índice y medio). El protocolo y el pipeline crecen para soportar 2 outputs.
+
+### 14.1 Schema CSV y firmware
+
+Frame binario v2 (31 B): `AA55 + t_micros[4] + 4×emg[4] + 4×joy[2] + crc[1]`.
+CSV columns: `pc_timestamp, t_micros, emg0..emg3, joy_ext_ind, joy_flex_ind,
+joy_ext_med, joy_flex_med, trial_id, task, session_id, subject_id, placement_id`.
+
+EMG mapping: `emg0=ext_ind, emg1=flx_ind, emg2=ext_med, emg3=flx_med` (single-ended
+vs AINCOM, PGA=1, DRATE 15 kSPS). Joysticks 4 ejes via ADC del ESP32 a 12 bits.
+
+`t_micros` es `uint32` del ESP32 → **overflowea cada ~71.5 min**. El dataset
+2-dedos detecta saltos negativos en `dt` y aplica `+2^32` desde ahí (unwrap).
+
+### 14.2 Pipeline 2-dedos
+
+- **`dataset/emg_dataset_2fingers.py`** (`EMGSession2FingersDataset`): replica
+  `compute_emg_features` para 2 pares y concatena → 16 features (8 por dedo:
+  `flx/ext × rms_norm, d_rms_norm, rms_slow_norm, d_rms_slow_norm`).
+- **`train_2fingers.py`**: TCN con `in_channels=16, output_dim=2`. Loss = Huber
+  sumado sobre los 2 outputs (cada dedo pesa igual). Target normalizado por dedo
+  independiente con p99 de `|vel|` (luego harmonizado entre sesiones).
+- **`visualize.py`**: detecta el modo por `output_dim` del checkpoint y arma
+  layout 2 cajitas side-by-side + 2 paneles de velocidad. Checkbox "show target"
+  para toggle del verde.
+
+### 14.3 Bug MPS + `eval()` con esta arquitectura
+
+**Síntoma**: train baja normal (data loss ~0.02), pero al entrar a `model.eval()`
+(sin dropout) el head Conv1d 1×1 produce predicciones explosivas (magnitudes 1e15
+a 1e23) en **uno** de los 2 outputs (índice o medio, no determinístico). Las
+métricas R²/Pearson colapsan a 0 para ese dedo; las del otro dedo siguen siendo
+válidas. `val_loss` queda igual EXACTAMENTE entre epochs (no varía con los pesos
+entrenados), confirmando que la salida problemática es constante/NaN en eval.
+
+**Confirmaciones**:
+- Pasa con L1Loss, Huber delta < 1.0, y a veces con Huber delta = 1.0.
+- Pasa con dropout 0.0, 0.05, 0.1, 0.15. NO depende del dropout.
+- Pasa con `--device cpu` mucho menos frecuentemente (pero también puede pasar).
+- NO se cura con `grad-clip` agresivo (es bug de eval, no de optimización).
+
+**Workaround**: clipear las predicciones a [-5, +5] dentro de `train_epoch` y
+`evaluate`:
+
+```python
+pred = model(x, horizon=...)
+pred = torch.clamp(pred, -5.0, 5.0)
+```
+
+Justificación del 5: los targets normalizados están en [-1.8, +1.8] (max real
+observado en S06+S07). ±5 es ~3× margen de seguridad. No corta predicciones
+válidas, sólo atrapa explosiones numéricas.
+
+### 14.4 Z-normalización robusta de features
+
+Los features procesados (post `rms_norm` y `d_rms_norm`) tienen escalas muy
+distintas:
+- `rms_norm`: mean ≈ 1, std ≈ 0.7 (clip 20 toca a ~0.1% de samples).
+- `d_rms_norm`: mean ≈ -0.2, std ≈ 12 (clip 20 toca **~28% de samples**).
+- `rms_slow_norm`: std ≈ 0.5.
+- `d_rms_slow_norm`: std ≈ 7.4 (sin outliers std ≈ 2.5 → colas 3× más pesadas
+  que normal).
+
+Esa asimetría hace que las derivadas dominen el gradient (escala 20× mayor).
+Para corregir: **z-norm por canal con median + MAD** (robust a outliers):
+
+```python
+median = np.median(features, axis=1)
+mad = np.median(|features − median|, axis=1) * 1.4826  # escala normal-equiv
+features_norm = (features − median) / (mad + 1e-6)
+```
+
+Stats calculados sobre **train solamente** (no val, evita leak), aplicados a
+train + val + inferencia online. Se guardan en `checkpoint["config"]` como
+`feature_median` y `feature_mad` (16 floats cada uno). `visualize.py` los carga
+del checkpoint y aplica antes de inferencia.
+
+### 14.5 Outliers raw EMG y exclusiones
+
+**`noise_wrist_grip`** está fuera del training para placements donde
+`emg0` (ext_ind) está cerca de los músculos pronadores de la muñeca — la
+contracción de la muñeca activa fuerte `emg0` (crosstalk), inflando los stats
+y creando samples que el modelo intenta predecir como "movimiento del índice".
+En placement D quedó claro: `noise_wrist_grip` aportaba 1500+ outliers a `emg0`.
+
+**Artifacts en `rest_baseline`**: si el sujeto acomoda el brazo en los primeros
+segundos, emg1/3 (flexores) pueden tener spikes que NO son señal muscular real.
+En S07 observamos 899 outliers de `emg1` concentrados en los primeros 45 s.
+Solución quirúrgica: borrar esos samples del CSV (preservando `.bak`).
+
+**Identificación**: 3 patrones de outliers en EMG raw:
+1. Crosstalk muscular (emg0 durante `noise_wrist_grip`, emg2 durante movimientos
+   del medio). **Real, no se elimina**.
+2. Artifact de electrodo en silencio (emg1 en `rest_baseline` S07). **Eliminable**.
+3. Picos puntuales de impacto/contacto (1-2 samples cada uno). Mitigados por
+   median+MAD norm.
+
+### 14.6 Resultados parciales (en progreso)
+
+Con S04+S05 (placements B + C):
+- Baseline Huber+Sobolev: avg R² ≈ 0.62 (ep 28).
+- + var matching λ=2: avg R² ≈ 0.62 (mejora std_ratio 0.74 → 0.97, R² igual).
+
+Con S06+S07 (placement D) sin z-norm: plateau temprano avg R² ≈ 0.53.
+
+Hipótesis: placement D introdujo más outliers en `emg0` (crosstalk pronadores)
+y artifacts en `emg1` (despegue durante rest). Combinado con feature_clip=20
+en derivadas (que ya saturaba ~28% antes), el modelo no aprende a distinguir
+slow vs fast en el dedo correspondiente. Z-norm robusta + exclusiones + clamp
+en pred son el approach actual para limpiar.
+
+---
+
 ## Apéndice — comandos de referencia
 
 ```bash

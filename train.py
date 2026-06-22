@@ -71,6 +71,17 @@ def parse_args():
     p.add_argument("--accel-weight", type=float, default=0.0,
                    help="peso del termino Sobolev/H1 = MSE(Δpred, Δtarget). "
                         "Requiere --horizon >= 2. Regulariza la derivada de la velocidad.")
+    p.add_argument("--var-weight", type=float, default=0.0,
+                   help="Variance matching: lambda * (std(pred_vel) - std(y_vel))^2. "
+                        "Fuerza al modelo a capturar la energia del target.")
+    p.add_argument("--upweight-tasks", nargs="+", default=[],
+                   help="Tasks que se upweightan via WeightedRandomSampler. "
+                        "Equivalente a multiplicar la loss por --upweight-factor en esas tasks.")
+    p.add_argument("--exclude-tasks", nargs="+", default=["transition"],
+                   help="Tasks excluidas tanto del train como del val. "
+                        "Default: transition.")
+    p.add_argument("--upweight-factor", type=float, default=1.0,
+                   help="Factor de oversampling para tasks en --upweight-tasks.")
     p.add_argument("--init-from", default=None,
                    help="path a un checkpoint para inicializar pesos (fine-tuning).")
     p.add_argument("--grad-clip", type=float, default=1.0)
@@ -214,7 +225,8 @@ def compute_metrics(preds: np.ndarray, targets: np.ndarray) -> dict:
 def train_epoch(model, loader, optimizer, loss_fn, device, grad_clip,
                 epoch: int, total_epochs: int, alpha_pos: float = 0.0,
                 smooth_weight: float = 0.0, horizon: int = 1,
-                accel_weight: float = 0.0, log_every: int = 50):
+                accel_weight: float = 0.0, var_weight: float = 0.0,
+                log_every: int = 50):
     """
     Si horizon == 1: pred_vel shape [B], y shape [B, 2]. Modelo actual.
     Si horizon  > 1: pred_vel shape [B, K], y shape [B, K, 2].
@@ -272,6 +284,13 @@ def train_epoch(model, loader, optimizer, loss_fn, device, grad_clip,
             loss = loss + accel_weight * loss_accel
         else:
             loss_accel = torch.tensor(0.0, device=device)
+
+        # Variance matching: penaliza std(pred) lejos de std(target).
+        if var_weight > 0:
+            loss_var = (pred_vel.flatten().std() - y_vel.flatten().std()) ** 2
+            loss = loss + var_weight * loss_var
+        else:
+            loss_var = torch.tensor(0.0, device=device)
 
         # TVD legacy cross-batch (solo horizon=1). Asume shuffle=False.
         if use_smooth:
@@ -444,6 +463,7 @@ def main():
             csv_path=csv_path,
             window_length=args.window_length,
             stride=1,
+            exclude_tasks=tuple(args.exclude_tasks),
             config=config,
             horizon=args.horizon,
             verbose=True,
@@ -496,10 +516,30 @@ def main():
     if use_smooth:
         print(f"Smoothness regularization activa (weight={args.smooth_weight}). "
               f"shuffle desactivado para preservar orden temporal en batches.")
+    # Weighted sampling: upweightear tasks especificas usando WeightedRandomSampler.
+    # Equivalente a multiplicar la loss por upweight_factor en samples de esas tasks.
+    train_sampler = None
+    if args.upweight_tasks and args.upweight_factor != 1.0:
+        train_tasks = np.array([
+            datasets[d_idx].task_at(local_idx)
+            for d_idx, local_idx in (lookup_concat(i, datasets) for i in train_idx)
+        ])
+        sample_weights = np.where(
+            np.isin(train_tasks, args.upweight_tasks),
+            args.upweight_factor, 1.0
+        ).astype(np.float64)
+        train_sampler = torch.utils.data.WeightedRandomSampler(
+            sample_weights, num_samples=len(train_idx), replacement=True,
+        )
+        upweighted = int((sample_weights > 1.0).sum())
+        print(f"Upweight: {args.upweight_factor}x sobre tasks {args.upweight_tasks} "
+              f"({upweighted}/{len(train_idx)} = {upweighted/len(train_idx)*100:.1f}% samples)")
+
     train_loader = DataLoader(
         Subset(concat, train_idx),
         batch_size=args.batch_size,
-        shuffle=shuffle_train,
+        shuffle=shuffle_train if train_sampler is None else False,
+        sampler=train_sampler,
         num_workers=args.num_workers,
         pin_memory=(device.type == "cuda"),
     )
@@ -586,6 +626,7 @@ def main():
             epoch=ep, total_epochs=args.epochs,
             alpha_pos=args.alpha_pos, smooth_weight=args.smooth_weight,
             horizon=args.horizon, accel_weight=args.accel_weight,
+            var_weight=args.var_weight,
         )
         val_metrics, val_preds, val_targets_arr = eval_epoch(
             model, val_loader, loss_fn, device,
