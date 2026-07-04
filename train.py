@@ -84,6 +84,20 @@ def parse_args():
                    help="Factor de oversampling para tasks en --upweight-tasks.")
     p.add_argument("--init-from", default=None,
                    help="path a un checkpoint para inicializar pesos (fine-tuning).")
+    p.add_argument("--feature-norm", default="none",
+                   choices=["none", "median_mad", "mean_std"],
+                   help="Z-normalizacion por canal sobre train. "
+                        "median_mad: (x-median)/(MAD*1.4826), robusto a outliers. "
+                        "mean_std: (x-mean)/std clasico. "
+                        "Stats se guardan en el checkpoint para inferencia.")
+    p.add_argument("--lr-scheduler", default="none", choices=["none", "plateau"],
+                   help="Scheduler de lr. plateau: reduce lr cuando val_loss no mejora.")
+    p.add_argument("--lr-factor", type=float, default=0.5,
+                   help="Factor de reduccion del lr en plateau (default 0.5 = mitad).")
+    p.add_argument("--lr-patience", type=int, default=10,
+                   help="Epochs sin mejora antes de reducir lr (default 10).")
+    p.add_argument("--lr-min", type=float, default=1e-5,
+                   help="lr minimo para el scheduler (default 1e-5).")
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "mps", "cuda"])
@@ -504,6 +518,31 @@ def main():
     print(f"Train windows: {len(train_idx):,}  (stride {args.train_stride})")
     print(f"Val   windows: {len(val_idx):,}  (stride {args.val_stride})")
 
+    # ----- Z-normalizacion opcional por canal -----
+    feat_center = feat_scale = None
+    if args.feature_norm in ("median_mad", "mean_std"):
+        feats_list = []
+        for ds in datasets:
+            mask = np.ones(ds.features.shape[1], dtype=bool)
+            for t in args.exclude_tasks:
+                mask &= ds.tasks != t
+            feats_list.append(ds.features[:, mask])
+        all_train_feats = np.concatenate(feats_list, axis=1)
+        if args.feature_norm == "median_mad":
+            feat_center = np.median(all_train_feats, axis=1).astype(np.float32)
+            mad = np.median(np.abs(all_train_feats - feat_center[:, None]), axis=1).astype(np.float32)
+            feat_scale = (mad * 1.4826 + 1e-6).astype(np.float32)
+            label_c, label_s = "median", "MAD*1.4826"
+        else:
+            feat_center = all_train_feats.mean(axis=1).astype(np.float32)
+            feat_scale = (all_train_feats.std(axis=1) + 1e-6).astype(np.float32)
+            label_c, label_s = "mean", "std"
+        print(f"\nFeature norm: {label_c} + {label_s}:")
+        for i, name in enumerate(datasets[0].feature_names):
+            print(f"  [{i:>2}] {name:<28} {label_c}={feat_center[i]:+.4f}  {label_s}={feat_scale[i]:.4f}")
+        for ds in datasets:
+            ds.apply_feature_norm(feat_center, feat_scale)
+
     # Tareas correspondientes a las ventanas de val (lookup con offsets)
     val_tasks = np.array([
         datasets[d_idx].task_at(local_idx)
@@ -602,6 +641,14 @@ def main():
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
     )
+    scheduler = None
+    if args.lr_scheduler == "plateau":
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=args.lr_factor,
+            patience=args.lr_patience, min_lr=args.lr_min,
+        )
+        print(f"Scheduler: ReduceLROnPlateau  factor={args.lr_factor}  "
+              f"patience={args.lr_patience}  min_lr={args.lr_min}")
     loss_fn = nn.HuberLoss(delta=args.huber_delta)
 
     # ---- Output dir ----
@@ -656,18 +703,26 @@ def main():
                 "csv_paths": list(args.csv),
                 "in_channels": in_channels,
                 "feature_names": list(datasets[0].feature_names),
+                "feature_norm": args.feature_norm,
+                "feature_center": feat_center.tolist() if feat_center is not None else None,
+                "feature_scale": feat_scale.tolist() if feat_scale is not None else None,
             }, out_dir / "best.pt")
             np.savez(
                 out_dir / "best_val_preds.npz",
                 preds=val_preds, targets=val_targets_arr, tasks=val_tasks,
             )
 
+        if scheduler is not None:
+            scheduler.step(val_metrics["loss"])
+        current_lr = optimizer.param_groups[0]["lr"]
+
         flag = " *" if is_best else ""
+        lr_str = f"  lr={current_lr:.2e}" if scheduler is not None else ""
         print(
             f"{ep:>3} {train_loss:>8.4f} {val_metrics['loss']:>8.4f} "
             f"{val_metrics['mae']:>8.4f} {val_metrics['rmse']:>8.4f} "
             f"{val_metrics['pearson']:>+7.3f} {val_metrics['r2']:>+7.3f} "
-            f"{elapsed:>5.1f}s{flag}"
+            f"{elapsed:>5.1f}s{flag}{lr_str}"
         )
 
         log.append({
@@ -684,6 +739,7 @@ def main():
             "val_r2": val_metrics["r2"],
             "elapsed_s": elapsed,
             "is_best": is_best,
+            "lr": current_lr,
         })
         with open(out_dir / "log.json", "w") as f:
             json.dump(log, f, indent=2)

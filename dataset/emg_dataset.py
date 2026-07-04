@@ -245,6 +245,10 @@ class EMGSessionDataset(Dataset):
             torch.from_numpy(y),
         )
 
+    def apply_feature_norm(self, center: np.ndarray, scale: np.ndarray) -> None:
+        """Z-normaliza features in-place por canal: (x - center) / scale."""
+        self.features = ((self.features - center[:, None]) / scale[:, None]).astype(np.float32)
+
     def task_at(self, idx: int) -> str:
         return str(self.tasks[int(self.indices[idx])])
 
