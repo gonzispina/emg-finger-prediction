@@ -16,12 +16,14 @@ from .serial_io import SerialReader
 CSV_COLUMNS = [
     "pc_timestamp",
     "t_micros",
-    "emg0",         # extensor del indice (ADS AIN0(+) AIN1(-))
-    "emg1",         # flexor   del indice (ADS AIN2(+) AIN3(-))
-    "emg2",         # extensor del medio  (ADS AIN4(+) AIN5(-))
-    "emg3",         # flexor   del medio  (ADS AIN6(+) AIN7(-))
-    "joy_a",        # joystick A indice (ESP32 GPIO5, 12-bit)
-    "joy_b",        # joystick B indice (ESP32 GPIO6, 12-bit)
+    "emg0",            # extensor del indice (ADS AIN0)
+    "emg1",            # flexor   del indice (ADS AIN2)
+    "emg2",            # extensor del medio  (ADS AIN4)
+    "emg3",            # flexor   del medio  (ADS AIN6)
+    "joy_ext_ind",     # eje extensor del joystick del indice (ESP32 GPIO5)
+    "joy_flex_ind",    # eje flexor   del joystick del indice (ESP32 GPIO6)
+    "joy_ext_med",     # eje extensor del joystick del medio  (ESP32 GPIO7)
+    "joy_flex_med",    # eje flexor   del joystick del medio  (ESP32 GPIO8)
     "trial_id",
     "task",
     "session_id",
@@ -70,8 +72,10 @@ def _record_phase(
             s.emg1,
             s.emg2,
             s.emg3,
-            s.joy_a,
-            s.joy_b,
+            s.joy_ext_ind,
+            s.joy_flex_ind,
+            s.joy_ext_med,
+            s.joy_flex_med,
             trial_id,
             task,
             session_id,
@@ -92,8 +96,11 @@ def run_session(
     output_dir: Path = Path("data/raw"),
     notes: str = "",
     countdown_seconds: int = 3,
+    blocks_override: Optional[List[Block]] = None,
 ) -> Path:
-    blocks: List[Block] = protocol_for_session(session_number)
+    blocks: List[Block] = (blocks_override
+                           if blocks_override is not None
+                           else protocol_for_session(session_number))
     session_id = make_session_id(subject_id, session_number)
     split = session_split(session_number)
 
@@ -113,7 +120,7 @@ def run_session(
         "started_at": datetime.now().isoformat(timespec="seconds"),
         "csv": csv_path.name,
         "csv_columns": CSV_COLUMNS,
-        "serial_format": "binary_v1_27B_AA55_t_4xemg_2xjoy_crc8",
+        "serial_format": "binary_v2_31B_AA55_t_4xemg_4xjoy_crc8",
         "countdown_seconds": countdown_seconds,
         "notes": notes,
         "blocks": [

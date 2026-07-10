@@ -1,7 +1,7 @@
 #include <Arduino.h>
 #include <SPI.h>
 
-#define FRAME_SIZE 27
+#define FRAME_SIZE 31
 #define MAGIC_HI 0xAA
 #define MAGIC_LO 0x55
 
@@ -12,9 +12,11 @@ static const int PIN_MOSI = 1;  // ADS DIN
 static const int PIN_CS   = 2;
 static const int PIN_DRDY = 4;
 
-// Joysticks
-static const int PIN_JOY_A = 5;
-static const int PIN_JOY_B = 6;
+// Joysticks (2 ejes por dedo) - todos ADC1 del ESP32-S3.
+static const int PIN_JOY_EXT_IND  = 5;   // ADC1_CH4
+static const int PIN_JOY_FLEX_IND = 6;   // ADC1_CH5
+static const int PIN_JOY_EXT_MED  = 7;   // ADC1_CH6
+static const int PIN_JOY_FLEX_MED = 8;   // ADC1_CH7
 
 SPIClass spiADS(HSPI);
 static const uint32_t SPI_HZ = 1920000;   // 1.92 MHz (max spec del ADS1256 = fclkin/4)
@@ -181,7 +183,7 @@ void setup() {
   Serial.print("# MUX=0x");    Serial.println(adsReadReg(REG_MUX), HEX);
   Serial.print("# ADCON=0x");  Serial.println(adsReadReg(REG_ADCON), HEX);
   Serial.print("# DRATE=0x");  Serial.println(adsReadReg(REG_DRATE), HEX);
-  Serial.println("# frame: AA55 t_us[4] emg[4] joy_a[2] joy_b[2] crc[1]");
+  Serial.println("# frame (31B): AA55 t_us[4] emg[4*4] joy_ext_ind[2] joy_flex_ind[2] joy_ext_med[2] joy_flex_med[2] crc[1]");
   Serial.flush();
 }
 
@@ -200,21 +202,25 @@ void loop() {
   setSingleEndedAIN6();
   emg3 = adsReadData24();
 
-  uint16_t joy_a = (uint16_t)analogReadRaw(PIN_JOY_A);
-  uint16_t joy_b = (uint16_t)analogReadRaw(PIN_JOY_B);
+  uint16_t joy_ext_ind  = (uint16_t)analogReadRaw(PIN_JOY_EXT_IND);
+  uint16_t joy_flex_ind = (uint16_t)analogReadRaw(PIN_JOY_FLEX_IND);
+  uint16_t joy_ext_med  = (uint16_t)analogReadRaw(PIN_JOY_EXT_MED);
+  uint16_t joy_flex_med = (uint16_t)analogReadRaw(PIN_JOY_FLEX_MED);
 
   uint32_t t = micros();
 
   frame[0] = MAGIC_HI;
   frame[1] = MAGIC_LO;
-  memcpy(&frame[2],  &t,     4);
-  memcpy(&frame[6],  &emg0,  4);
-  memcpy(&frame[10], &emg1,  4);
-  memcpy(&frame[14], &emg2,  4);
-  memcpy(&frame[18], &emg3,  4);
-  memcpy(&frame[22], &joy_a, 2);
-  memcpy(&frame[24], &joy_b, 2);
-  frame[26] = crc8(&frame[2], 24);
+  memcpy(&frame[2],  &t,             4);
+  memcpy(&frame[6],  &emg0,          4);
+  memcpy(&frame[10], &emg1,          4);
+  memcpy(&frame[14], &emg2,          4);
+  memcpy(&frame[18], &emg3,          4);
+  memcpy(&frame[22], &joy_ext_ind,   2);
+  memcpy(&frame[24], &joy_flex_ind,  2);
+  memcpy(&frame[26], &joy_ext_med,   2);
+  memcpy(&frame[28], &joy_flex_med,  2);
+  frame[30] = crc8(&frame[2], 28);
 
   // Push al queue para que el task de core 0 haga el Serial.write.
   // Si la queue esta llena, descartamos el frame (mejor que bloquear el

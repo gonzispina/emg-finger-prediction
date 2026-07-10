@@ -21,13 +21,25 @@ Uso:
     python visualize.py --checkpoint checkpoints/tcn_2f_s04s05_baseline/best.pt \\
                         --csv data/raw/P01/P01_S05_20260618_172229.csv
 
+    # MODO LIVE (ESP32 en vivo):
+    python visualize.py --checkpoint checkpoints/tcn_s02s03_RF567_sobolev01_200ep/best.pt \\
+                        --port /dev/cu.usbmodem21101
+
+    # MODO LIVE (mock sin hardware):
+    python visualize.py --checkpoint checkpoints/tcn_s02s03_RF567_sobolev01_200ep/best.pt \\
+                        --mock
+
     # Sin target visible
     python visualize.py ... --hide-target
 """
 from __future__ import annotations
 
 import argparse
+import collections
+import struct
+import time
 from pathlib import Path
+from typing import Optional
 
 import matplotlib.animation as animation
 import matplotlib.patches as patches
@@ -35,17 +47,180 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 from matplotlib.widgets import CheckButtons
-from scipy.signal import lfilter
+from scipy.signal import butter, lfilter, sosfilt_zi
 
 from dataset import DEFAULT_FEATURE_SET, EMGSessionDataset, PreprocessConfig
 from dataset.emg_dataset_2fingers import EMGSession2FingersDataset, PreprocessConfig2F
 from models import EMGTCN
 
 
+# ── Frame protocol (ESP32) ────────────────────────────────────────────────────
+_FRAME_SIZE  = 31
+_MAGIC       = b"\xAA\x55"
+_PAYLOAD_FMT = "<I4iHHHH"
+
+def _crc8_table_init() -> bytes:
+    table = []
+    for i in range(256):
+        crc = i
+        for _ in range(8):
+            crc = (crc << 1) ^ 0x07 if crc & 0x80 else crc << 1
+            crc &= 0xFF
+        table.append(crc)
+    return bytes(table)
+
+_CRC8_TABLE = _crc8_table_init()
+
+def _crc8(data: bytes) -> int:
+    crc = 0
+    for b in data:
+        crc = _CRC8_TABLE[crc ^ b]
+    return crc
+
+
+# ── Streams ───────────────────────────────────────────────────────────────────
+
+class _SerialStream:
+    def __init__(self, port: str, baud: int = 2000000):
+        import serial
+        self.ser = serial.Serial(port, baud, timeout=0.01)
+        self.buf = bytearray()
+
+    def read(self) -> Optional[np.ndarray]:
+        nwait = self.ser.in_waiting
+        if nwait:
+            self.buf.extend(self.ser.read(nwait))
+        while True:
+            idx = self.buf.find(_MAGIC)
+            if idx < 0:
+                if len(self.buf) > 1024:
+                    del self.buf[:-1]
+                return None
+            if idx > 0:
+                del self.buf[:idx]
+            if len(self.buf) < _FRAME_SIZE:
+                return None
+            frame = bytes(self.buf[:_FRAME_SIZE])
+            if frame[30] == _crc8(frame[2:30]):
+                del self.buf[:_FRAME_SIZE]
+                _, e0, e1, e2, e3, j_ei, j_fi, j_em, j_fm = struct.unpack(
+                    _PAYLOAD_FMT, frame[2:30])
+                return np.array([e0, e1, e2, e3, j_ei, j_fi, j_em, j_fm],
+                                dtype=np.float32)
+            del self.buf[0]
+
+    def close(self):
+        try: self.ser.close()
+        except Exception: pass
+
+
+class _MockStream:
+    def __init__(self, fs: float = 606.0):
+        self.fs  = fs
+        self.dt  = 1.0 / fs
+        self.t0  = time.monotonic()
+        self.n   = 0
+        self.rng = np.random.default_rng(0)
+        self._ph = self.rng.random(4) * 2 * np.pi
+
+    def read(self) -> Optional[np.ndarray]:
+        t_now = time.monotonic() - self.t0
+        if int(t_now * self.fs) <= self.n:
+            return None
+        self.n += 1
+        t = self.n * self.dt
+        env  = np.array([0.5 * (1 + np.sin(2*np.pi*0.4*t + self._ph[i])) for i in range(4)])
+        emg  = (env * 2000 * self.rng.standard_normal(4)).clip(-8388607, 8388607)
+        joy  = 512 + 480 * np.sin(2*np.pi * np.array([0.3, 0.3, 0.25, 0.25]) * t
+                                  + np.array([0, np.pi, 0.5, 0.5+np.pi]))
+        return np.array([*emg, *joy], dtype=np.float32)
+
+    def close(self): pass
+
+
+# ── Online feature pipeline ───────────────────────────────────────────────────
+
+class _OnlineBandpass:
+    def __init__(self, fs: float, low=70.0, high=300.0, order=4):
+        nyq = fs / 2.0
+        self.sos = butter(order, [low/nyq, min(high, nyq*0.95)/nyq],
+                          btype="bandpass", output="sos")
+        self.zi = sosfilt_zi(self.sos) * 0.0
+
+    def push(self, x: float) -> float:
+        from scipy.signal import sosfilt
+        y, self.zi = sosfilt(self.sos, np.array([x]), zi=self.zi)
+        return float(y[0])
+
+
+class _OnlineRMS:
+    def __init__(self, fs: float, window_ms: float):
+        win = max(1, int(round(window_ms / 1000.0 * fs)))
+        self.buf   = collections.deque([0.0]*win, maxlen=win)
+        self.sum_sq = 0.0
+        self.count  = 0
+        self.win    = win
+
+    def push(self, x: float) -> float:
+        old = self.buf[0]
+        self.sum_sq += x*x - old*old
+        self.buf.append(x)
+        self.count = min(self.count + 1, self.win)
+        return float(np.sqrt(max(0.0, self.sum_sq) / self.count))
+
+
+class _OnlineEMA:
+    def __init__(self, fs: float, tau_s: float = 1.0, eps: float = 1e-6):
+        self.alpha = 1.0 - float(np.exp(-1.0/(fs*tau_s)))
+        self.state = None
+        self.eps   = eps
+
+    def normalize(self, x: float) -> float:
+        self.state = x if self.state is None else (self.alpha*x + (1-self.alpha)*self.state)
+        return x / (self.state + self.eps)
+
+
+class _OnlineChannelPipeline:
+    """raw → BP → RMS(fast+slow)/EMA. Emite features en el mismo orden que training."""
+
+    def __init__(self, fs: float, feature_set: list[str]):
+        self.fs         = fs
+        self.feature_set = feature_set
+        self.bp         = _OnlineBandpass(fs)
+        self.rms_f      = _OnlineRMS(fs, 40.0)
+        self.rms_s      = _OnlineRMS(fs, 150.0)
+        self.ema_f      = _OnlineEMA(fs, 1.0)
+        self.ema_s      = _OnlineEMA(fs, 1.0)
+        self._prev_f    = 0.0
+        self._prev_s    = 0.0
+
+    def push(self, raw: float) -> np.ndarray:
+        bp = self.bp.push(raw)
+        out = []
+        if "rms_norm" in self.feature_set or "d_rms_norm" in self.feature_set:
+            rn = self.ema_f.normalize(self.rms_f.push(abs(bp)))
+            drn = rn - self._prev_f;  self._prev_f = rn
+            if "rms_norm"   in self.feature_set: out.append(rn)
+            if "d_rms_norm" in self.feature_set: out.append(drn)
+        if "rms_slow_norm" in self.feature_set or "d_rms_slow_norm" in self.feature_set:
+            rsn = self.ema_s.normalize(self.rms_s.push(abs(bp)))
+            drsn = rsn - self._prev_s;  self._prev_s = rsn
+            if "rms_slow_norm"   in self.feature_set: out.append(rsn)
+            if "d_rms_slow_norm" in self.feature_set: out.append(drsn)
+        return np.array(out, dtype=np.float32)
+
+
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", required=True)
-    p.add_argument("--csv", required=True)
+    p.add_argument("--csv", default=None,
+                   help="CSV para replay (omitir si se usa --port o --mock)")
+    p.add_argument("--port", default=None,
+                   help="Puerto serial para inferencia live")
+    p.add_argument("--baud", type=int, default=2000000,
+                   help="Baud rate serial (default 2000000 para ESP32; usar 1000000 con Arduino)")
+    p.add_argument("--mock", action="store_true",
+                   help="Stream mock (sin hardware, para probar)")
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "mps", "cuda"])
     p.add_argument("--speed", type=float, default=2.0,
                    help="playback speed (1.0 = realtime)")
@@ -236,7 +411,8 @@ def build_box_panel(ax, title, p_low, p_high, margin, start_position_true,
             ha="center", fontsize=10, fontweight="bold", color="seagreen")
     ax.text(+0.35, y_lim[0] + margin * 0.4, "predicho",
             ha="center", fontsize=10, fontweight="bold", color="crimson")
-    return {"true_circle": true_circle, "pred_circle": pred_circle, "y_lim": y_lim}
+    return {"true_circle": true_circle, "pred_circle": pred_circle,
+            "y_lim": y_lim, "box_patch": box}
 
 
 def build_velocity_panel(ax, title, fs, v_lim):
@@ -263,8 +439,253 @@ def build_velocity_panel(ax, title, fs, v_lim):
             "vel_buf_len": vel_buf_len}
 
 
+def run_live(args):
+    """
+    Modo live: inferencia online desde serial (o mock).
+
+    Estrategia: rolling buffer de 10s de raw samples. Cada UPDATE_EVERY muestras,
+    corre compute_emg_features() y compute_target_velocity() sobre el buffer completo
+    (las mismas funciones que usa el replay) y toma el último valor.
+    Con 10s de historia la EMA está bien inicializada.
+    """
+    from dataset.preprocessing import compute_emg_features, compute_target_velocity
+
+    device = pick_device(args.device)
+    model, ckpt = load_model(args.checkpoint, device)
+    cfg      = ckpt["config"]
+    mode     = detect_mode(ckpt)
+    fs       = float(ckpt.get("fs") or cfg.get("fs") or 606.0)
+    dt       = 1.0 / fs
+    features = cfg.get("features") or list(DEFAULT_FEATURE_SET)
+    sigma_ms = float(cfg.get("sigma_ms", 50.0))
+    window_len = cfg["window_length"]
+    print(f"Modo live — {mode} dedo(s)  |  features={features}  |  fs={fs:.0f} Hz  |  sigma={sigma_ms}ms")
+
+    # Buffer crudo: 10s para que la EMA (tau=1s) esté inicializada al leer el extremo
+    HISTORY_N = max(window_len, int(10.0 * fs))
+
+    # Joy init con 512 (centro de hardware) → pos = (-512+512)×2 = 0 = centro de cajita
+    # EMG init con 0 (sin actividad)
+    raw = {}
+    for ch in ("emg0", "emg1", "emg2", "emg3"):
+        raw[ch] = collections.deque([0.0] * HISTORY_N, maxlen=HISTORY_N)
+    for ch in ("joy_ext_ind", "joy_flex_ind", "joy_ext_med", "joy_flex_med"):
+        raw[ch] = collections.deque([512.0] * HISTORY_N, maxlen=HISTORY_N)
+
+    if mode == 1:
+        target_scales = [float(ckpt["target_scale"])]
+    else:
+        target_scales = [float(ckpt["target_scale_ind"]), float(ckpt["target_scale_med"])]
+
+    # Estado del leaky integrator de posición predicha
+    pos_state = [0.0] * mode
+
+    # Stream
+    if args.port:
+        stream = _SerialStream(args.port, baud=args.baud)
+        print(f"Serial: {args.port} @ {args.baud} bps")
+    else:
+        stream = _MockStream(fs=fs)
+        print("Mock stream (sin hardware)")
+
+    # ── Paneles: Arduino 10-bit, joy 0-1023, centro ~512
+    # Posicion = -(joy_ext - 512) + -(joy_flex - 512), rango real ≈ ±512
+    p_low, p_high, margin = -600.0, 600.0, 80.0
+    v_amp = max(target_scales)   # target_scale = max vel de entrenamiento
+
+    # Dead zone auto-calibrada desde los primeros 3s de predicciones (asume reposo inicial)
+    dz_state   = {"value": 0.0, "computed": False}
+    pred_vel_warmup: list[list[float]] = [[] for _ in range(mode)]
+    DZ_WARMUP_N = int(3.0 * fs)
+
+    n = mode
+    if n == 1:
+        fig, (ax_box, ax_vel) = plt.subplots(
+            2, 1, figsize=(6, 10), gridspec_kw={"height_ratios": [3, 1]})
+        finger_axes = [{"box": ax_box, "vel": ax_vel}]
+    else:
+        fig, axs = plt.subplots(
+            2, n, figsize=(6*n, 10), gridspec_kw={"height_ratios": [3, 1]})
+        finger_axes = [{"box": axs[0, i], "vel": axs[1, i]} for i in range(n)]
+
+    labels = ["INDICE"] if n == 1 else ["INDICE", "MEDIO"]
+    box_artists = []
+    vel_artists = []
+    for i, fa in enumerate(finger_axes):
+        ba = build_box_panel(fa["box"], labels[i] + "  (live)",
+                             p_low, p_high, margin, 0.0, 0.0)
+        va = build_velocity_panel(fa["vel"], None, fs, (-v_amp, v_amp))
+        box_artists.append(ba); vel_artists.append(va)
+
+    ax_check = fig.add_axes([0.02, 0.92, 0.13, 0.05])
+    check = CheckButtons(ax_check, ["show target"], [True])
+
+    def toggle(label):
+        v = check.get_status()[0]
+        for ba in box_artists: ba["true_circle"].set_visible(v)
+        for va in vel_artists:  va["real_line"].set_visible(v)
+        fig.canvas.draw_idle()
+    check.on_clicked(toggle)
+
+    status_text = finger_axes[0]["box"].text(
+        0, p_high + margin * 0.6, "", ha="center", fontsize=10, family="monospace")
+
+    sample_count   = [0]
+    real_samples   = [0]  # muestras reales recibidas (para offset dinámico)
+
+    # EMA persistente para suavizar pred_vel entre frames (evita reset cada llamada)
+    pred_ema_state = [0.0] * mode
+    pred_ema_alpha = 1.0 - np.exp(-1.0 / (fs * args.vel_smooth_tau)) if args.vel_smooth_tau > 0 else 1.0
+
+    def _arr(key): return np.array(raw[key], dtype=np.float64)
+
+    def _joy_offset(key_ext, key_flx):
+        """Median del buffer completo (incluye init + datos reales).
+        Con init=512 el offset arranca correcto para Arduino desde el primer sample.
+        Para ESP32 converge a ~1900 en cuanto llegan datos reales."""
+        arr_ext = np.array(raw[key_ext])
+        arr_flx = np.array(raw[key_flx])
+        return float(np.median(arr_ext)), float(np.median(arr_flx))
+
+    @torch.no_grad()
+    def _compute_frame(new_samples: int):
+        """Devuelve (true_pos, true_vel_arr, pred_vel_arr) donde *_arr tiene longitud new_samples."""
+        # ── Features (mismas funciones que el replay) ─────────────────────────
+        if mode == 1:
+            feats, _ = compute_emg_features(
+                _arr("emg1"), _arr("emg0"), fs, feature_set=features)
+        else:
+            fi, _ = compute_emg_features(_arr("emg1"), _arr("emg0"), fs, feature_set=features)
+            fm, _ = compute_emg_features(_arr("emg3"), _arr("emg2"), fs, feature_set=features)
+            feats = np.concatenate([fi, fm], axis=0)  # [C, T]
+
+        # ── Pred: predict_full_sequence sobre los últimos window_len+new_samples ──
+        n_ctx = window_len + new_samples
+        preds_norm = predict_full_sequence(model, feats[:, -n_ctx:].astype(np.float32), device)
+        pred_raw_arr = preds_norm[:, -new_samples:]  # [output_dim, new_samples]
+
+        # ── True position+velocity (offset dinámico del joystick) ──────────────
+        off_ei, off_fi = _joy_offset("joy_ext_ind", "joy_flex_ind")
+        joy_ind, vel_ind = compute_target_velocity(
+            _arr("joy_ext_ind"), _arr("joy_flex_ind"), fs=fs, sigma_ms=sigma_ms,
+            top_offset=off_ei, bottom_offset=off_fi)
+
+        true_pos = np.zeros(mode)
+        true_vel = np.zeros((mode, new_samples))
+        true_pos[0] = float(joy_ind[-1])
+        true_vel[0]  = vel_ind[-new_samples:]
+
+        if mode == 2:
+            off_em, off_fm = _joy_offset("joy_ext_med", "joy_flex_med")
+            # Medio: joy_ext_med sube en extensión (→4095) y joy_flex_med baja en flexión (→0).
+            # Para mostrar extensión=positivo (igual que índice) NO negamos; pasamos ya negados
+            # al compute_target_velocity que internamente hace -y+offset:
+            #   -(-joy_ext_med) + (-off_em) = joy_ext_med - off_em  → positivo en extensión ✓
+            # Equivalente a llamar con 4095-joy_ext_med como "top" usando offset 4095-off_em.
+            # Más simple: computar directo sin compute_target_velocity.
+            from dataset.preprocessing import gaussian_smooth_target, central_diff
+            je_med = _arr("joy_ext_med"); jf_med = _arr("joy_flex_med")
+            joy_med = (gaussian_smooth_target(je_med - off_em, fs, sigma_ms)
+                       + gaussian_smooth_target(-(jf_med - off_fm), fs, sigma_ms))
+            vel_med = central_diff(joy_med, dt=1.0/fs)
+            true_pos[1] = float(joy_med[-1])
+            true_vel[1]  = vel_med[-new_samples:]
+
+        # ── Pred velocity: warmup mask + EMA persistente + dead zone ───────────
+        pred_vel = np.zeros((mode, new_samples))
+        # Warmup: igual que replay (zeroa primeros 1s para que la EMA arranque limpia)
+        warmup_done = real_samples[0] > int(fs * 1.0)
+        dz = float(args.dead_zone) if args.dead_zone else dz_state["value"]
+        for i in range(mode):
+            v_raw = pred_raw_arr[i] * target_scales[i]
+            if i == 1:
+                v_raw = -v_raw
+            if not warmup_done:
+                v_raw[:] = 0.0
+            # EMA persistente muestra a muestra
+            v_smooth = np.empty_like(v_raw)
+            for t, vt in enumerate(v_raw):
+                pred_ema_state[i] = pred_ema_alpha * float(vt) + (1 - pred_ema_alpha) * pred_ema_state[i]
+                v_smooth[t] = pred_ema_state[i]
+            # Acumular para calibrar dead zone en los primeros 3s
+            if not dz_state["computed"]:
+                pred_vel_warmup[i].extend(v_smooth.tolist())
+            v_smooth = apply_dead_zone(v_smooth, dz)
+            pred_vel[i] = v_smooth
+
+        # Auto dead zone: p95 de las pred vel en los primeros 3s (asume reposo)
+        if not dz_state["computed"] and real_samples[0] >= DZ_WARMUP_N:
+            all_vels = []
+            for wup in pred_vel_warmup:
+                all_vels.extend(wup)
+            if all_vels:
+                dz_state["value"] = float(np.percentile(np.abs(all_vels), 95))
+                dz_state["computed"] = True
+                print(f"[live] dead_zone auto: {dz_state['value']:.1f}")
+
+        return true_pos, true_vel, pred_vel
+
+    def update(_frame):
+        new_samples = 0
+        while True:
+            sample = stream.read()
+            if sample is None:
+                break
+            new_samples += 1
+            sample_count[0] += 1
+            for ch, idx in [("emg0", 0), ("emg1", 1), ("emg2", 2), ("emg3", 3),
+                             ("joy_ext_ind", 4), ("joy_flex_ind", 5),
+                             ("joy_ext_med", 6), ("joy_flex_med", 7)]:
+                raw[ch].append(float(sample[idx]))
+
+        if new_samples == 0:
+            return ()
+
+        real_samples[0] += new_samples
+        true_pos, true_vel, pred_vel = _compute_frame(new_samples)
+
+        # Leaky integrar posición predicha muestra a muestra
+        leak = dt / args.leak_tau if args.leak_tau > 0 else 0.0
+        for i in range(mode):
+            for v in pred_vel[i]:
+                pos_state[i] = np.clip(
+                    pos_state[i] * (1 - leak) + float(v) * dt,
+                    p_low, p_high)
+
+            ba = box_artists[i]
+            ba["true_circle"].center = (-0.35, float(true_pos[i]))
+            ba["pred_circle"].center = (+0.35, pos_state[i])
+
+            va = vel_artists[i]
+            k = new_samples
+            va["real_buf"][:-k] = va["real_buf"][k:]
+            va["pred_buf"][:-k] = va["pred_buf"][k:]
+            va["real_buf"][-k:] = true_vel[i]
+            va["pred_buf"][-k:] = pred_vel[i]
+            va["real_line"].set_ydata(va["real_buf"])
+            va["pred_line"].set_ydata(va["pred_buf"])
+
+        status_text.set_text(f"t={sample_count[0]/fs:.1f}s")
+        return ()
+
+    anim = animation.FuncAnimation(fig, update, interval=33, blit=False, cache_frame_data=False)
+    plt.tight_layout(rect=[0, 0, 1, 0.91])
+    try:
+        plt.show()
+    finally:
+        stream.close()
+
+
 def main():
     args = parse_args()
+
+    if args.port or args.mock:
+        run_live(args)
+        return
+
+    if not args.csv:
+        raise SystemExit("--csv es obligatorio en modo replay (o usá --port / --mock para live)")
+
     device = pick_device(args.device)
     print(f"Device: {device}")
 
@@ -286,19 +707,23 @@ def main():
             verbose=False,
         )
         target_scales = {"single": float(ckpt["target_scale"])}
+        _joy_raw = ds.joy.astype(np.float64)
+        _rest = ds.tasks == "rest_baseline"
+        _joy_center = float(np.median(_joy_raw[_rest])) if _rest.any() else float(np.median(_joy_raw))
         fingers = [{
             "key":           "single",
             "label":         "Finger",
-            "true_position": ds.joy.astype(np.float64),
+            "true_position": _joy_raw - _joy_center,
             "true_velocity": ds.target_raw.astype(np.float64),
             "pred_idx":      0,
         }]
     else:
+        ckpt_features_2f = tuple(cfg.get("features", ("rms_norm", "d_rms_norm")))
         ds = EMGSession2FingersDataset(
             args.csv,
             window_length=cfg["window_length"],
             stride=1,
-            config=PreprocessConfig2F(sigma_ms=ckpt_sigma),
+            config=PreprocessConfig2F(sigma_ms=ckpt_sigma, feature_set=ckpt_features_2f),
             verbose=False,
         )
         # Aplicar z-norm con stats del entrenamiento. Formato actual: feature_center
@@ -409,9 +834,9 @@ def main():
     # ----- Construccion de paneles por dedo -----
     for f, fa in zip(fingers, finger_axes):
         tp = f["true_position"]
-        p_low = float(np.percentile(tp, 1))
-        p_high = float(np.percentile(tp, 99))
-        margin = (p_high - p_low) * 0.15
+        p_abs = max(abs(float(np.percentile(tp, 1))), abs(float(np.percentile(tp, 99))))
+        p_low, p_high = -p_abs, p_abs
+        margin = p_abs * 0.15
         f["box_artists"] = build_box_panel(
             fa["box"], f["label"], p_low, p_high, margin,
             float(tp[start_sample]), float(f["pred_position"][start_sample]),

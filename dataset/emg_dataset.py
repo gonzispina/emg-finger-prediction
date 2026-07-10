@@ -104,7 +104,7 @@ class EMGSessionDataset(Dataset):
         self.config = config or PreprocessConfig()
 
         df = pd.read_csv(self.csv_path)
-        required = {"t_micros", "y_top", "y_bottom", "flexor", "extensor", "task"}
+        required = {"t_micros", "joy_ext_ind", "joy_flex_ind", "emg0", "emg1", "task"}
         missing = required - set(df.columns)
         if missing:
             raise ValueError(f"Faltan columnas en {self.csv_path}: {missing}")
@@ -112,10 +112,10 @@ class EMGSessionDataset(Dataset):
         t_sec = df["t_micros"].to_numpy(dtype=np.float64) / 1e6
         self.fs = estimate_fs(t_sec)
 
-        y_top = df["y_top"].to_numpy()
-        y_bottom = df["y_bottom"].to_numpy()
-        flexor = df["flexor"].to_numpy()
-        extensor = df["extensor"].to_numpy()
+        y_top = df["joy_ext_ind"].to_numpy()
+        y_bottom = df["joy_flex_ind"].to_numpy()
+        flexor = df["emg1"].to_numpy()
+        extensor = df["emg0"].to_numpy()
 
         joy, velocity = compute_target_velocity(
             y_top, y_bottom,

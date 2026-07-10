@@ -34,6 +34,10 @@ ALL_FEATURE_TYPES = (
     "d_rms_norm",       # backward diff de rms_norm
     "rms_slow_norm",    # RMS(150ms) / EMA(1s) — smoothed amplitude
     "d_rms_slow_norm",  # backward diff de rms_slow_norm
+    "rms",              # RMS(40ms) crudo (sin EMA) — para ablation
+    "d_rms",            # backward diff de rms crudo
+    "rms_slow",         # RMS(150ms) crudo (sin EMA) — para ablation
+    "d_rms_slow",       # backward diff de rms_slow crudo
     "wl_norm",          # WL(40ms) / EMA(1s)
     "d_wl_norm",        # backward diff de wl_norm
     "ssc_norm",         # slope sign changes(40ms) / EMA(1s) — info espectral
@@ -242,22 +246,36 @@ def _channel_features(
     out: Dict[str, np.ndarray] = {}
 
     needs_rms_norm = "rms_norm" in feature_set or "d_rms_norm" in feature_set
-    if needs_rms_norm:
+    needs_rms_raw  = "rms"      in feature_set or "d_rms"      in feature_set
+    if needs_rms_norm or needs_rms_raw:
         rms = causal_rms(x_bp, fs, rms_window_ms)
-        rms_norm = ema_normalize(rms, fs, ema_tau_s)
-        if "rms_norm" in feature_set:
-            out["rms_norm"] = rms_norm
-        if "d_rms_norm" in feature_set:
-            out["d_rms_norm"] = backward_diff(rms_norm, dt)
+        if needs_rms_norm:
+            rms_norm = ema_normalize(rms, fs, ema_tau_s)
+            if "rms_norm" in feature_set:
+                out["rms_norm"] = rms_norm
+            if "d_rms_norm" in feature_set:
+                out["d_rms_norm"] = backward_diff(rms_norm, dt)
+        if needs_rms_raw:
+            if "rms" in feature_set:
+                out["rms"] = rms
+            if "d_rms" in feature_set:
+                out["d_rms"] = backward_diff(rms, dt)
 
-    needs_rms_slow = "rms_slow_norm" in feature_set or "d_rms_slow_norm" in feature_set
-    if needs_rms_slow:
+    needs_rms_slow     = "rms_slow_norm" in feature_set or "d_rms_slow_norm" in feature_set
+    needs_rms_slow_raw = "rms_slow"      in feature_set or "d_rms_slow"      in feature_set
+    if needs_rms_slow or needs_rms_slow_raw:
         rms_slow = causal_rms(x_bp, fs, rms_slow_window_ms)
-        rms_slow_norm = ema_normalize(rms_slow, fs, ema_tau_s)
-        if "rms_slow_norm" in feature_set:
-            out["rms_slow_norm"] = rms_slow_norm
-        if "d_rms_slow_norm" in feature_set:
-            out["d_rms_slow_norm"] = backward_diff(rms_slow_norm, dt)
+        if needs_rms_slow:
+            rms_slow_norm = ema_normalize(rms_slow, fs, ema_tau_s)
+            if "rms_slow_norm" in feature_set:
+                out["rms_slow_norm"] = rms_slow_norm
+            if "d_rms_slow_norm" in feature_set:
+                out["d_rms_slow_norm"] = backward_diff(rms_slow_norm, dt)
+        if needs_rms_slow_raw:
+            if "rms_slow" in feature_set:
+                out["rms_slow"] = rms_slow
+            if "d_rms_slow" in feature_set:
+                out["d_rms_slow"] = backward_diff(rms_slow, dt)
 
     needs_wl_norm = "wl_norm" in feature_set or "d_wl_norm" in feature_set
     if needs_wl_norm:

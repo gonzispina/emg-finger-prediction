@@ -1,11 +1,13 @@
 """
 Monitor en vivo de las senales del nuevo setup ESP32 + ADS1256:
-  4 EMG diferenciales del ADS1256 (emg0..emg3)
-+ 2 ADC interno joysticks (joy_a, joy_b) — ambos miden el mismo dedo
-  (indice) para redundancia. Solo se cablea una salida por joystick.
+  4 EMG del ADS1256 (emg0..emg3)
++ 4 ADC interno joysticks (2 ejes por dedo):
+    joy_ext_ind  / joy_flex_ind  -> indice
+    joy_ext_med  / joy_flex_med  -> medio
 
 Schema del stream (debe coincidir con el firmware ESP32):
-    t_micros, emg0, emg1, emg2, emg3, joy_a, joy_b
+    t_micros, emg0, emg1, emg2, emg3,
+    joy_ext_ind, joy_flex_ind, joy_ext_med, joy_flex_med
 
 Convencion de canales EMG (ver docs/hardware_setup.md):
     emg0 = extensor del indice  (AIN0+ AIN1-)
@@ -49,17 +51,19 @@ from scipy.signal import butter, iirnotch, sosfilt, sosfilt_zi, tf2sos
 # Etiquetas semanticas (flexor/extensor de indice/medio) son convencion;
 # la asignacion fisica depende del cableado (ver docs/hardware_setup.md).
 CHANNELS = [
-    ("emg0 (ext_ind)", "tab:blue"),
-    ("emg1 (flx_ind)", "tab:red"),
-    ("emg2 (ext_med)", "tab:cyan"),
-    ("emg3 (flx_med)", "tab:orange"),
-    ("joy_a",          "tab:green"),
-    ("joy_b",          "tab:purple"),
+    ("emg0 (ext_ind)",  "tab:blue"),
+    ("emg1 (flx_ind)",  "tab:red"),
+    ("emg2 (ext_med)",  "tab:cyan"),
+    ("emg3 (flx_med)",  "tab:orange"),
+    ("joy_ext_ind",     "tab:green"),
+    ("joy_flex_ind",    "tab:olive"),
+    ("joy_ext_med",     "tab:purple"),
+    ("joy_flex_med",    "tab:brown"),
 ]
 N_CH = len(CHANNELS)
 # Indices logicos
 EMG_IDX = slice(0, 4)
-JOY_IDX = slice(4, 6)
+JOY_IDX = slice(4, 8)
 
 
 # ----- Stream readers -----
@@ -75,19 +79,21 @@ class StreamReader:
 
 
 # ----- Binary protocol del firmware ESP32 -----
-# Frame de 27 bytes (ver sketchs/esp32/src/main.cpp):
+# Frame de 31 bytes (ver sketchs/esp32/src/main.cpp):
 #   [0..1]   magic 0xAA 0x55
-#   [2..5]   t_micros uint32 LE
-#   [6..9]   emg0     int32  LE
-#   [10..13] emg1     int32  LE
-#   [14..17] emg2     int32  LE
-#   [18..21] emg3     int32  LE
-#   [22..23] joy_a    uint16 LE
-#   [24..25] joy_b    uint16 LE
-#   [26]     CRC-8 (poly 0x07, init 0x00) sobre [2..25]
-FRAME_SIZE = 27
+#   [2..5]   t_micros      uint32 LE
+#   [6..9]   emg0          int32  LE
+#   [10..13] emg1          int32  LE
+#   [14..17] emg2          int32  LE
+#   [18..21] emg3          int32  LE
+#   [22..23] joy_ext_ind   uint16 LE
+#   [24..25] joy_flex_ind  uint16 LE
+#   [26..27] joy_ext_med   uint16 LE
+#   [28..29] joy_flex_med  uint16 LE
+#   [30]     CRC-8 (poly 0x07, init 0x00) sobre [2..29]
+FRAME_SIZE = 31
 MAGIC = b"\xAA\x55"
-PAYLOAD_FMT = "<I4iHH"
+PAYLOAD_FMT = "<I4iHHHH"
 
 
 def _crc8_table_init() -> bytes:
@@ -139,8 +145,8 @@ class SerialStream(StreamReader):
             if len(self.buf) < FRAME_SIZE:
                 return None
             frame = bytes(self.buf[:FRAME_SIZE])
-            expected = frame[26]
-            actual = crc8(frame[2:26])
+            expected = frame[30]
+            actual = crc8(frame[2:30])
             if expected == actual:
                 del self.buf[:FRAME_SIZE]
                 self.frames_ok += 1
@@ -157,8 +163,11 @@ class SerialStream(StreamReader):
         frame = self._find_frame()
         if frame is None:
             return None
-        t_us, e0, e1, e2, e3, j_a, j_b = struct.unpack(PAYLOAD_FMT, frame[2:26])
-        sample = np.array([e0, e1, e2, e3, j_a, j_b], dtype=np.float32)
+        t_us, e0, e1, e2, e3, j_ei, j_fi, j_em, j_fm = struct.unpack(
+            PAYLOAD_FMT, frame[2:30]
+        )
+        sample = np.array([e0, e1, e2, e3, j_ei, j_fi, j_em, j_fm],
+                          dtype=np.float32)
         t_now = time.monotonic() - self.t0
         return (t_now, sample)
 
@@ -201,12 +210,12 @@ class MockStream(StreamReader):
         if self.rng.random() < 0.001:
             emg += self.rng.standard_normal(4) * 2.0
 
-        # Joysticks sinteticos
-        joy_freq = np.array([0.25, 0.22])
-        joy_phase = np.array([0.0, np.pi / 3])
-        joy_raw = 512 + 480 * np.sin(2 * np.pi * joy_freq * t + joy_phase)
-        joy = np.clip(joy_raw, 0, 1023)
-        joy += self.rng.standard_normal(2) * 1.5
+        # Joysticks sinteticos: 4 ejes (2 por dedo).
+        joy_freq = np.array([0.25, 0.30, 0.22, 0.27])
+        joy_phase = np.array([0.0, np.pi / 2, np.pi / 3, np.pi])
+        joy_raw = 2048 + 1800 * np.sin(2 * np.pi * joy_freq * t + joy_phase)
+        joy = np.clip(joy_raw, 0, 4095)
+        joy += self.rng.standard_normal(4) * 4.0
 
         sample = np.concatenate([emg, joy]).astype(np.float32)
         return (t, sample)
@@ -270,19 +279,24 @@ class Monitor:
                  notch_base: float = 50.0,
                  notch_q: float = 30.0,
                  joy_sigma_ms: float = 50.0,
-                 apply_filters: bool = True):
+                 apply_filters: bool = True,
+                 channel_mask: List[int] = None):
         self.stream = stream
         self.fs = fs
         self.window_seconds = window_seconds
         self.fps = fps
-        # Guardamos los params originales para poder rebuild si fs_real
-        # difiere significativamente de fs (auto-ajuste de filtros).
         self._emg_bp_low = emg_bp_low
         self._emg_bp_high = emg_bp_high
         self._emg_bp_order = emg_bp_order
         self._notch_base = notch_base
         self._notch_q = notch_q
         self._joy_sigma_ms = joy_sigma_ms
+
+        # channel_mask: indices (0-7) de CHANNELS a mostrar; None = todos
+        self._ch_mask = channel_mask if channel_mask is not None else list(range(N_CH))
+        self._channels_shown = [CHANNELS[i] for i in self._ch_mask]
+        self._n_show = len(self._ch_mask)
+
         self.buf = RollingBuffer(
             capacity=int(window_seconds * fs * 1.2),
             n_channels=N_CH,
@@ -292,15 +306,16 @@ class Monitor:
         self._build_filters(fs)
         self._build_display(fs)
 
-        # Figure: N_CH axes verticales + status text por canal
-        self.fig, self.axes = plt.subplots(
-            N_CH, 1, sharex=True, figsize=(11, 7.5),
+        # Figure: _n_show axes verticales + status text por canal
+        self.fig, axes_raw = plt.subplots(
+            self._n_show, 1, sharex=True, figsize=(11, max(4.0, 1.0 * self._n_show + 2.0)),
         )
+        self.axes = [axes_raw] if self._n_show == 1 else list(axes_raw)
         self.fig.subplots_adjust(left=0.07, right=0.78, top=0.95, bottom=0.06,
                                  hspace=0.22)
         self.lines = []
         self.stat_texts = []
-        for i, (ax, (name, color)) in enumerate(zip(self.axes, CHANNELS)):
+        for i, (ax, (name, color)) in enumerate(zip(self.axes, self._channels_shown)):
             (ln,) = ax.plot(self.x_axis, self.display[:, i],
                             color=color, lw=0.9)
             self.lines.append(ln)
@@ -309,7 +324,7 @@ class Monitor:
             ax.tick_params(labelsize=7)
             ax.grid(True, alpha=0.25)
             txt = self.fig.text(
-                0.80, 1.0 - 0.06 - (i + 0.5) * (0.90 / N_CH),
+                0.80, 1.0 - 0.06 - (i + 0.5) * (0.90 / self._n_show),
                 "", fontsize=8, va="center",
                 family="monospace",
             )
@@ -326,7 +341,7 @@ class Monitor:
         self.fs_real = 0.0
         self._fs_filter_design = fs
         self._last_rebuild = 0.0
-        self._ylim_state = [None] * N_CH
+        self._ylim_state = [None] * self._n_show
 
     def _build_display(self, fs: float) -> None:
         """Inicializa el display buffer (fixed-size, NaN = nada que mostrar)
@@ -334,7 +349,7 @@ class Monitor:
         self.display_samples = max(2, int(self.window_seconds * fs))
         self.x_axis = np.linspace(-self.window_seconds, 0.0,
                                   self.display_samples)
-        self.display = np.full((self.display_samples, N_CH), np.nan,
+        self.display = np.full((self.display_samples, self._n_show), np.nan,
                                dtype=np.float32)
 
     def _build_filters(self, fs: float) -> None:
@@ -391,7 +406,7 @@ class Monitor:
             new_capacity = int(self.window_seconds * self.fs_real * 1.2)
             self.buf = RollingBuffer(capacity=new_capacity, n_channels=N_CH)
             self._build_display(self.fs_real)
-            self._ylim_state = [None] * N_CH
+            self._ylim_state = [None] * self._n_show
             for i, ln in enumerate(self.lines):
                 ln.set_data(self.x_axis, self.display[:, i])
             self._last_rebuild = now
@@ -428,7 +443,7 @@ class Monitor:
         x_w = x
 
         if self.apply_filters and x_w.shape[0] > 0:
-            # Pipeline EMG: detrend -> notch -> bandpass.
+            # Pipeline EMG: detrend -> notch -> bandpass (always on all 4 raw EMG).
             if self.notch_sos is not None or self.emg_sos is not None:
                 bp_zi_template = (sosfilt_zi(self.emg_sos)
                                   if self.emg_sos is not None else None)
@@ -446,24 +461,26 @@ class Monitor:
                         sig_ac, _ = sosfilt(self.emg_sos, sig_ac, zi=zi)
                     x_w[:, i] = sig_ac
             if self.joy_sigma_samples > 0.5:
-                for i in range(4, 6):
+                for i in range(4, 8):
                     x_w[:, i] = gaussian_filter1d(x_w[:, i],
                                                   sigma=self.joy_sigma_samples,
                                                   mode="nearest")
 
         mask = t >= t_start
-        t_w = t[mask] - t_end
         x_w = x_w[mask, :]
 
+        # Seleccionar solo los canales a mostrar
+        x_show = x_w[:, self._ch_mask]
+
         # Resample/copy del rolling buffer al display buffer (tamano fijo).
-        n_src = x_w.shape[0]
+        n_src = x_show.shape[0]
         n_dst = self.display_samples
         if n_src >= n_dst:
             idx = np.linspace(0, n_src - 1, n_dst).astype(np.int64)
-            self.display[:, :] = x_w[idx, :]
+            self.display[:, :] = x_show[idx, :]
         else:
             self.display[:-n_src, :] = np.nan
-            self.display[-n_src:, :] = x_w
+            self.display[-n_src:, :] = x_show
 
         # Update traces solo con set_ydata (eje X estatico)
         for i, ln in enumerate(self.lines):
@@ -476,12 +493,13 @@ class Monitor:
             valid = valid[~np.isnan(valid)]
             if valid.size < 4:
                 continue
-            if i < 4:  # EMG
+            i_raw = self._ch_mask[i]
+            if i_raw < 4:  # EMG
                 mid = float(valid.mean())
                 sd = float(valid.std())
                 half = max(3.0 * sd, 1.0)
                 target = (mid - half, mid + half)
-            else:      # joysticks
+            else:          # joysticks
                 lo = float(np.percentile(valid, 1))
                 hi = float(np.percentile(valid, 99))
                 pad = max(1.0 * (hi - lo), 1e-3)
@@ -496,11 +514,12 @@ class Monitor:
             ax.set_ylim(*smoothed)
 
         # Update stats text
-        for i, (name, _) in enumerate(CHANNELS):
+        for i, (name, _) in enumerate(self._channels_shown):
+            i_raw = self._ch_mask[i]
             valid = self.display[:, i]
             valid = valid[~np.isnan(valid)]
             s = channel_stats(valid) if valid.size > 0 else channel_stats(np.array([0.0]))
-            if i < 4:   # EMG
+            if i_raw < 4:   # EMG
                 self.stat_texts[i].set_text(
                     f"{name:<14}\n"
                     f"  RMS: {s['rms']:8.2f}\n"
@@ -508,7 +527,7 @@ class Monitor:
                     f"  std: {s['std']:8.2f}\n"
                     f"  range: [{s['min']:+7.1f}, {s['max']:+7.1f}]"
                 )
-            else:       # joysticks
+            else:           # joysticks
                 self.stat_texts[i].set_text(
                     f"{name:<14}\n"
                     f"  mean: {s['mean']:8.1f}\n"
@@ -545,6 +564,10 @@ def parse_args():
                    help="origen del stream.")
     p.add_argument("--port", default=None,
                    help="puerto serial (solo si --source serial)")
+    p.add_argument("--baud", type=int, default=2000000,
+                   help="baud rate serial (default 2000000 para ESP32; usar 1000000 con Arduino)")
+    p.add_argument("--finger", choices=["ind", "med", "both"], default="both",
+                   help="mostrar solo canales del dedo indice, medio, o ambos (default: both)")
     p.add_argument("--fs", type=float, default=1000.0,
                    help="fs objetivo (Hz). Si la fs real medida difiere "
                         ">10%%, el monitor reconstruye filtros automaticamente.")
@@ -571,6 +594,9 @@ def parse_args():
                         "Usar 0 para desactivar.")
     p.add_argument("--notch-q", type=float, default=30.0,
                    help="Q del notch (mayor = mas estrecho)")
+    p.add_argument("--no-notch", action="store_true",
+                   help="desactiva la cascada de notch (equivale a --notch-base 0). "
+                        "Util cuando alimentas todo por DC/USB y no hay PLI.")
     p.add_argument("--joy-sigma-ms", type=float, default=50.0,
                    help="sigma del gaussiano sobre joysticks (ms)")
     return p.parse_args()
@@ -585,8 +611,8 @@ def main():
     elif args.source == "serial":
         if args.port is None:
             raise SystemExit("--port es obligatorio con --source serial")
-        print(f"Serial stream: port={args.port}, baud=2000000")
-        stream = SerialStream(port=args.port, baud=2000000)
+        print(f"Serial stream: port={args.port}, baud={args.baud}")
+        stream = SerialStream(port=args.port, baud=args.baud)
     else:
         raise SystemExit(f"unknown source: {args.source}")
 
@@ -595,8 +621,17 @@ def main():
     else:
         emg_low = 0.0 if args.no_emg_filter else args.emg_low
         emg_high = 0.0 if args.no_emg_filter else args.emg_high
-        notch_base = 0.0 if args.no_emg_filter else args.notch_base
+        notch_base = (0.0 if (args.no_emg_filter or args.no_notch)
+                      else args.notch_base)
         joy_sigma = 0.0 if args.no_joy_filter else args.joy_sigma_ms
+
+    # channel_mask: ind=[emg0,emg1,joy_ext_ind,joy_flex_ind], med=[emg2,emg3,joy_ext_med,joy_flex_med]
+    finger_masks = {
+        "ind":  [0, 1, 4, 5],
+        "med":  [2, 3, 6, 7],
+        "both": list(range(N_CH)),
+    }
+    channel_mask = finger_masks[args.finger]
 
     monitor = Monitor(
         stream=stream,
@@ -609,6 +644,7 @@ def main():
         notch_q=args.notch_q,
         joy_sigma_ms=joy_sigma,
         apply_filters=True,
+        channel_mask=channel_mask,
     )
     print(f"Window: {args.window_seconds:.1f} s")
     print(f"FPS: {args.fps}")

@@ -20,7 +20,8 @@ from collection.serial_io import SerialReader
 
 CSV_COLUMNS = ["pc_timestamp", "t_micros",
                "emg0", "emg1", "emg2", "emg3",
-               "joy_a", "joy_b"]
+               "joy_ext_ind", "joy_flex_ind",
+               "joy_ext_med", "joy_flex_med"]
 
 
 def parse_args():
@@ -74,7 +75,8 @@ def main():
                     continue
                 writer.writerow([now, s.t_micros,
                                  s.emg0, s.emg1, s.emg2, s.emg3,
-                                 s.joy_a, s.joy_b])
+                                 s.joy_ext_ind, s.joy_flex_ind,
+                                 s.joy_ext_med, s.joy_flex_med])
                 written += 1
     except KeyboardInterrupt:
         print("\nInterrumpido.")

@@ -45,6 +45,8 @@ def parse_args():
                    help="tamaño del kernel temporal en todas las convs")
     p.add_argument("--dilations", type=int, nargs="+", default=[1, 3, 9, 27, 81],
                    help="lista de dilataciones (5 valores: 2 bloques residuales + capa final)")
+    p.add_argument("--bp-low", type=float, default=70.0,
+                   help="frecuencia de corte inferior del bandpass EMG (Hz). Default 70.")
     p.add_argument("--sigma-ms", type=float, default=150.0,
                    help="sigma del gaussiano que suaviza la posicion del joystick antes "
                         "de derivar para sacar la velocidad target. Default 150 ms.")
@@ -67,10 +69,12 @@ def parse_args():
                         "0 = sin smoothness. Preferir --horizon + --accel-weight.")
     p.add_argument("--horizon", type=int, default=1,
                    help="cuantos timesteps finales predecir por ventana. "
-                        "1 = comportamiento clasico. >=2 habilita --accel-weight.")
+                        "1 = comportamiento clasico (recomendado con --accel-weight). "
+                        ">=2 = extiende input_length; legacy para Sobolev con target matching.")
     p.add_argument("--accel-weight", type=float, default=0.0,
-                   help="peso del termino Sobolev/H1 = MSE(Δpred, Δtarget). "
-                        "Requiere --horizon >= 2. Regulariza la derivada de la velocidad.")
+                   help="peso del termino Sobolev/H1. Con horizon=1 (recomendado): "
+                        "H1 seminorm = MSE(Δpred) sobre todos los outputs de la ventana, "
+                        "sin extender el input. Con horizon>=2 (legacy): MSE(Δpred, Δtarget).")
     p.add_argument("--var-weight", type=float, default=0.0,
                    help="Variance matching: lambda * (std(pred_vel) - std(y_vel))^2. "
                         "Fuerza al modelo a capturar la energia del target.")
@@ -242,10 +246,14 @@ def train_epoch(model, loader, optimizer, loss_fn, device, grad_clip,
                 accel_weight: float = 0.0, var_weight: float = 0.0,
                 log_every: int = 50):
     """
-    Si horizon == 1: pred_vel shape [B], y shape [B, 2]. Modelo actual.
-    Si horizon  > 1: pred_vel shape [B, K], y shape [B, K, 2].
-        - L_data  = Huber(pred_vel, y_vel)         sobre los K timesteps.
-        - L_accel = MSE(Δpred_vel, Δy_vel)         sobre las K-1 diferencias.
+    Si horizon == 1 (recomendado con accel_weight):
+        - Dataset da input [B, C, wl], target [B, 2].
+        - Para Sobolev: llama model(x, horizon=wl) -> [B, out, wl], toma todos los
+          outputs consecutivos y calcula H1 seminorm = MSE(Δpred) sin necesitar target
+          sequence. Loss de datos solo sobre el ultimo output (RF completo).
+    Si horizon > 1 (legacy):
+        - Dataset extiende input a wl+horizon-1; target [B, K, 2].
+        - Sobolev = MSE(Δpred, Δtarget) sobre K outputs.
     """
     model.train()
     total, n = 0.0, 0
@@ -254,23 +262,32 @@ def train_epoch(model, loader, optimizer, loss_fn, device, grad_clip,
     t_start = time.time()
     use_multitask = alpha_pos > 0.0
     use_smooth = smooth_weight > 0.0 and horizon == 1
-    use_accel = accel_weight > 0.0 and horizon > 1
+    use_accel = accel_weight > 0.0
     prev_pred_vel = None                               # state cross-batch para TVD legacy
 
     for i, (x, y) in enumerate(loader, start=1):
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)            # [B, 2] o [B, K, 2]
 
+        pred_vel_seq = None                            # secuencia completa, solo con horizon=1+accel
+
         if horizon == 1:
             y_vel = y[:, 0]                            # [B]
             y_pos = y[:, 1]                            # [B]
-            pred = model(x, horizon=1)                 # [B, output_dim]
-            if use_multitask:
-                pred_vel = pred[:, 0]
-                pred_pos = pred[:, 1]
+            if use_accel:
+                wl = x.shape[2]
+                pred_all = model(x, horizon=wl)        # [B, output_dim, wl]
+                pred_vel_seq = pred_all[:, 0, :]       # [B, wl] — para Sobolev
+                pred_vel = pred_vel_seq[:, -1]         # [B]     — ultimo output para loss datos
+                pred_pos = pred_all[:, 1, -1] if use_multitask else None
             else:
-                pred_vel = pred.squeeze(-1)
-                pred_pos = None
+                pred = model(x, horizon=1)             # [B, output_dim]
+                if use_multitask:
+                    pred_vel = pred[:, 0]
+                    pred_pos = pred[:, 1]
+                else:
+                    pred_vel = pred.squeeze(-1)
+                    pred_pos = None
         else:
             y_vel = y[..., 0]                          # [B, K]
             y_pos = y[..., 1]                          # [B, K]
@@ -290,11 +307,17 @@ def train_epoch(model, loader, optimizer, loss_fn, device, grad_clip,
             loss_pos = torch.tensor(0.0, device=device)
             loss = loss_vel
 
-        # Sobolev/H1: MSE sobre la derivada (intra-ventana).
+        # Sobolev/H1 sobre la derivada temporal de la prediccion.
         if use_accel:
-            d_pred = pred_vel[:, 1:] - pred_vel[:, :-1]     # [B, K-1]
-            d_target = y_vel[:, 1:] - y_vel[:, :-1]         # [B, K-1], es gt -> sin grad
-            loss_accel = ((d_pred - d_target) ** 2).mean()
+            if horizon == 1:
+                # H1 seminorm: MSE(Δpred) sobre toda la ventana, sin target sequence.
+                d_pred = pred_vel_seq[:, 1:] - pred_vel_seq[:, :-1]   # [B, wl-1]
+                loss_accel = d_pred.pow(2).mean()
+            else:
+                # Legacy horizon>1: MSE(Δpred, Δtarget) con target sequence del dataset.
+                d_pred = pred_vel[:, 1:] - pred_vel[:, :-1]           # [B, K-1]
+                d_target = y_vel[:, 1:] - y_vel[:, :-1]
+                loss_accel = ((d_pred - d_target) ** 2).mean()
             loss = loss + accel_weight * loss_accel
         else:
             loss_accel = torch.tensor(0.0, device=device)
@@ -455,8 +478,6 @@ def main():
     print(f"Device: {device}")
 
     # ---- Validacion de combinaciones ----
-    if args.accel_weight > 0.0 and args.horizon < 2:
-        raise ValueError("--accel-weight requiere --horizon >= 2")
     if args.smooth_weight > 0.0 and args.horizon > 1:
         raise ValueError(
             "--smooth-weight (legacy TVD cross-batch) no es compatible con --horizon > 1. "
@@ -469,7 +490,8 @@ def main():
     if args.horizon > 1:
         print(f"Horizon: {args.horizon} timesteps (output K, input extendido a "
               f"{args.window_length + args.horizon - 1})")
-    config = PreprocessConfig(feature_set=tuple(args.features), sigma_ms=args.sigma_ms)
+    config = PreprocessConfig(feature_set=tuple(args.features), sigma_ms=args.sigma_ms,
+                              bp_low=args.bp_low)
     datasets = []
     for csv_path in args.csv:
         print(f"  - {csv_path}")

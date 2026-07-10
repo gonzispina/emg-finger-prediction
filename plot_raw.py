@@ -6,7 +6,8 @@ Genera un panel con:
   - Senal filtrada (bandpass causal).
   - FFT (magnitud, log scale) — para identificar peaks de ruido (50/60 Hz,
     harmonics, switching).
-  - Joysticks crudos.
+  - Joysticks crudos: 2 paneles (indice y medio), cada uno con sus
+    2 ejes (ext y flex) superpuestos.
 
 El proposito es diagnostico: ver donde esta el ruido, si la senal muscular
 real esta ahi (oculta por DC offset o picos), y a que frecuencia.
@@ -38,6 +39,9 @@ def parse_args():
                         "Usar 0 para desactivar.")
     p.add_argument("--notch-q", type=float, default=30.0,
                    help="Q del notch (mayor = mas estrecho). Default 30.")
+    p.add_argument("--no-notch", action="store_true",
+                   help="desactiva la cascada de notch (equivale a --notch-base 0). "
+                        "Util cuando alimentas todo por DC/USB y no hay PLI.")
     p.add_argument("--fft-xmax", type=float, default=1000.0,
                    help="frecuencia maxima a mostrar en los paneles FFT (Hz). "
                         "Lo real esta acotado por Nyquist=fs/2, mas alla queda en blanco.")
@@ -100,6 +104,8 @@ def fft_magnitude(x: np.ndarray, fs: float):
 
 def main():
     args = parse_args()
+    if args.no_notch:
+        args.notch_base = 0.0
     df = pd.read_csv(args.csv)
 
     fs = detect_fs(df["t_micros"].to_numpy())
@@ -111,8 +117,8 @@ def main():
 
     n_emg = len(emg_cols)
     # Estructura: por cada EMG: raw + filtered. Despues 2 paneles de FFT
-    # (raw y filtered, agregando todos los EMG) y por ultimo los joysticks.
-    n_rows = n_emg * 2 + 2 + 1
+    # (raw y filtered) + 2 paneles de joysticks (indice y medio).
+    n_rows = n_emg * 2 + 2 + 2
     fig, axes = plt.subplots(n_rows, 1, figsize=(13, 2.0 * n_rows))
     axes = list(axes)
 
@@ -205,16 +211,26 @@ def main():
     ax.grid(alpha=0.3, which="both")
     ax.legend(fontsize=8, ncol=len(emg_cols))
 
-    # Joysticks (los 2 en un mismo axis)
-    ax = axes[ax_idx]; ax_idx += 1
-    ax.plot(t_s, df["joy_a"].to_numpy(), lw=0.7, color="tab:green", label="joy_a")
-    ax.plot(t_s, df["joy_b"].to_numpy(), lw=0.7, color="tab:purple", label="joy_b")
-    ax.set_title(f"Joysticks (raw, ADC 12-bit)", fontsize=9)
-    ax.set_xlabel("tiempo (s)", fontsize=8)
-    ax.set_ylabel("ADC", fontsize=8)
-    ax.tick_params(labelsize=7)
-    ax.grid(alpha=0.3)
-    ax.legend(fontsize=8)
+    # Joysticks: 2 paneles (uno por dedo), cada uno con sus 2 ejes superpuestos.
+    joy_panels = [
+        ("Joystick INDICE (raw, ADC 12-bit)",
+         [("joy_ext_ind",  "tab:green"),
+          ("joy_flex_ind", "tab:olive")]),
+        ("Joystick MEDIO (raw, ADC 12-bit)",
+         [("joy_ext_med",  "tab:purple"),
+          ("joy_flex_med", "tab:brown")]),
+    ]
+    for i, (title, cols) in enumerate(joy_panels):
+        ax = axes[ax_idx]; ax_idx += 1
+        for col, color in cols:
+            ax.plot(t_s, df[col].to_numpy(), lw=0.7, color=color, label=col)
+        ax.set_title(title, fontsize=9)
+        if i == len(joy_panels) - 1:
+            ax.set_xlabel("tiempo (s)", fontsize=8)
+        ax.set_ylabel("ADC", fontsize=8)
+        ax.tick_params(labelsize=7)
+        ax.grid(alpha=0.3)
+        ax.legend(fontsize=8)
 
     plt.tight_layout()
     if args.out:
