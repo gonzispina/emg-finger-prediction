@@ -34,3 +34,5 @@ plots/
 sketchs/esp32/.pio/
 sketchs/esp32/.pioenvs/
 sketchs/esp32/.piolibdeps/
+
+logs/
