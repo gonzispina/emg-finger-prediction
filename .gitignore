@@ -29,6 +29,9 @@ plots/*.pdf
 # Presentacion
 presentation/
 
+# Notebooks (exploracion, no versionar)
+notebooks/
+
 # IDE / OS
 .DS_Store
 .vscode/
