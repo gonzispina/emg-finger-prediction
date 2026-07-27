@@ -1177,6 +1177,124 @@ descartados como bottleneck principal.
 
 ---
 
+### 10.9 Transición a raw RMS y expansión multi-sesión S02–S11
+
+#### Motivación
+
+Con las features EMA-normalizadas (`rms_norm = rms / ema(rms)`) el modelo nunca predecía
+extensión en modo live. Diagnóstico: la normalización EMA borra la asimetría DC entre
+canales. En reposo, `flx_rms ≈ 15 ADC` y `ext_rms ≈ 4.5 ADC` — esa diferencia es
+informativa para el modelo (le dice en qué estado basal está el músculo), pero `ema`
+la aplana a ≈ 1 en ambos canales. Sin esa asimetría, el modelo no puede distinguir
+"extensor activo con respecto a su propio baseline" de "flexor activo".
+
+**Solución**: reemplazar las features normalizadas por su equivalente crudo:
+
+| Feature set EMA (previo) | Feature set raw (actual) |
+|--------------------------|--------------------------|
+| `flx_rms_norm = flx_rms / ema(flx_rms)` | `flx_rms` (RMS 40 ms sin normalizar) |
+| `ext_rms_norm = ext_rms / ema(ext_rms)` | `ext_rms` |
+| `flx_d_rms_norm` (derivada del normalizado) | `flx_d_rms` (derivada del crudo) |
+| `ext_d_rms_norm` | `ext_d_rms` |
+| `flx_rms_slow_norm` | `flx_rms_slow` (RMS 150 ms) |
+| `ext_rms_slow_norm` | `ext_rms_slow` |
+| `flx_d_rms_slow_norm` | `flx_d_rms_slow` |
+| `ext_d_rms_slow_norm` | `ext_d_rms_slow` |
+
+8 canales en ambos casos; las dimensiones del modelo no cambian. El clipping de
+seguridad sigue en ±20 (en unidades ADC, donde el rango útil del ADS1256 es ≈ 0–8388607).
+
+**Consecuencia esperada**: las features crudas pierden la capacidad de "comparar con el
+propio baseline temporal" que daba `rms_norm`, pero ganan la diferencia estática entre
+canales. En la práctica, con suficientes sesiones la TCN aprende esa línea de base
+implícitamente desde el RMS crudo.
+
+#### Resultado de la transición
+
+Con S02+S03+S08+S09+S10 (primera run con raw):
+
+| | EMA-norm S02–S09 (prev champion) | raw RMS S02–S10 |
+|---|---|---|
+| Val Pearson R | 0.501 | 0.795 |
+| Val R² | — | 0.632 |
+
+La mejora sobre val es sustancial. El modelo live pasó a predecir extensión
+correctamente desde la primera sesión de prueba.
+
+#### Nuevos champions: S02–S11, σ=50 ms, RF=567
+
+Entrenamiento con 6 sesiones (S02, S03, S08, S09, S10, S11), raw RMS, σ=50 ms,
+`ReduceLROnPlateau` (factor=0.5, patience=5, lr_min=1e-5), 100 epochs.
+
+**Configuración compartida**:
+
+| Parámetro | Valor |
+|-----------|-------|
+| `features` | `rms d_rms rms_slow d_rms_slow` (8 canales) |
+| `sigma_ms` | 50 |
+| `dilations` | `[1, 3, 9, 27, 81]` → RF=567 samples ≈ 885 ms |
+| `hidden_channels` | 32 |
+| `target_scale` | 3978.5 (harmonizado, p99 sobre 6 sesiones) |
+| `lr` | 3e-4 |
+| `batch_size` | 256 |
+| `lr_scheduler` | `ReduceLROnPlateau` |
+| `weight_norm` | activado |
+
+**Champion: sobolev** (`--accel-weight 0.1`):
+
+| Métrica | Valor |
+|---------|-------|
+| Checkpoint | `tcn_s02s03s08s09s10s11_rawrms_sig050_RF567_h32_sobolev01_plateau_100ep/best.pt` |
+| Best epoch | 69 |
+| Val Pearson R | **0.798** |
+| Val R² | 0.636 |
+| TEST R² (free_controlled) | **0.818** |
+| TEST Pearson r | **0.906** |
+
+**Alternativa: no-sobolev** (`--accel-weight 0.0`):
+
+| Métrica | Valor |
+|---------|-------|
+| Checkpoint | `tcn_s02s03s08s09s10s11_rawrms_sig050_RF567_h32_nosobolev_plateau_100ep/best.pt` |
+| Best epoch | 88 |
+| Val Pearson R | **0.798** |
+| Val R² | 0.634 |
+| TEST R² (free_controlled) | **0.827** |
+| TEST Pearson r | **0.911** |
+| TEST MAE (rest) | 44 joy/s ← significativamente menor que sobolev (228 joy/s) |
+
+**Decisión**: se mantiene el modelo **con Sobolev** como champion activo. Razones:
+
+1. Converge 19 epochs antes (ep 69 vs 88) con prácticamente la misma val R.
+2. La diferencia TEST R² (+0.009 a favor de no-sobolev) está dentro del ruido
+   de una sola sesión de evaluación.
+3. El MAE en `rest_baseline` dramáticamente menor del no-sobolev (44 vs 228)
+   sugiere que ese modelo suprime mejor el ruido en reposo, pero el dataset TEST
+   solo tiene `free_controlled` + `rest` — sin más tasks no es concluyente.
+4. La regularización Sobolev sigue siendo teóricamente deseable para deployment
+   (predicciones más suaves, menos jitter en el controlador).
+
+#### Generalización cross-placement
+
+El modelo raw RMS generaliza bien **dentro del mismo placement** (S08–S11 =
+misma sesión de eléctrodos, julio 2026) pero pierde en placements distintos:
+
+| Dataset | raw RMS S02–S11 | EMA S02–S09 (previo) |
+|---------|-----------------|----------------------|
+| TEST S00 (mismo día, mismo placement) | R²=**0.818** | R²≈0.50 |
+| Sesiones junio 18 (placement distinto) | R²≈**−0.032** | R²≈+0.090 |
+
+El modelo EMA toleraba mejor el cambio de placement porque la normalización por EMA
+absorbía parcialmente las diferencias de ganancia entre sesiones. El modelo raw RMS
+es más sensible a la posición absoluta de los electrodos — a cambio de mejor
+rendimiento cuando el placement es consistente.
+
+**Implicación para colección de datos**: mantener un `placement_id` fijo y
+re-entrenar ante cualquier reposicionamiento significativo. Con >4 sesiones del
+mismo placement el modelo raw RMS supera al EMA.
+
+---
+
 ## 11. Visualización (offline replay y plan online)
 
 ### 11.1 Replay offline
@@ -1471,3 +1589,54 @@ robothand/
 └── docs/
     └── methods.md                 #   este documento
 ```
+
+---
+
+## Adaptive target preprocessing (propuesto)
+
+### Motivación
+
+El joystick con resorte introduce dos artefactos en el target de velocidad:
+
+1. **Rozamiento estático (stick-slip)**: el joystick permanece fijo hasta que la fuerza supera la fricción, generando un salto abrupto en posición → pico agudo en velocidad que no refleja la intención motora.
+2. **Amplitud de señal EMG dependiente del resorte**: al resistir el resorte el sujeto ejerce más fuerza, generando EMG más intenso que en movimiento libre. Esto reduce la generalización a contextos sin joystick.
+
+### Solución: sigma adaptivo por task (target)
+
+Se aplica un Gaussiano no-causal (offline, simétrico) sobre la **posición** antes de derivar la velocidad. El sigma varía según la tarea para preservar la forma relevante de cada movimiento:
+
+| Sigma | Tasks |
+|---|---|
+| **80 ms** | `slow_flex_ind`, `slow_ext_ind`, `holds_intermediate_ind`, `slow_cycles_ind` |
+| **50 ms** | `fast_flex_ind`, `fast_ext_ind`, `microcorrections_ind`, `free_controlled_ind`, y resto |
+
+**Justificación**: las tareas lentas y holds tienen movimientos sostenidos donde el stick-slip del resorte genera transiciones artificialmente bruscas; sigma=80ms suaviza esas transiciones sin atenuar la amplitud de los movimientos lentos. Las tareas rápidas y microcorrecciones requieren preservar los transientes — sigma=50ms (actual) es suficiente.
+
+Este preprocesamiento se aplica **solo en entrenamiento** (offline). En inferencia online el joystick opera normalmente y no se requiere ningún procesamiento adicional del target.
+
+### Solución: compresión de picos EMG (augmentación)
+
+**Objetivo**: reducir el efecto del resorte del joystick, que obliga al sujeto a ejercer más fuerza durante la grabación de lo que ejercería online (donde el dedo se mueve libremente). Comprimir los picos de RMS simula señales de amplitud más cercana a la que el modelo verá en inferencia.
+
+Para comprimir, se suprime la excursión del RMS por encima del baseline de reposo de la sesión:
+
+```
+rms_compressed[t] = rms[t]                                      si rms[t] ≤ baseline
+rms_compressed[t] = baseline + (rms[t] - baseline) * α          si rms[t] > baseline
+```
+
+donde `α ∈ (0, 1)` controla el grado de compresión (α=1 = sin compresión).
+
+**Baseline por sesión**: mediana del RMS durante los últimos 10 s de la task `rest_baseline` de esa sesión. Este valor es un escalar fijo (no EMA) que representa el nivel de actividad muscular en reposo, calculado al final de la sesión cuando el sujeto está completamente relajado.
+
+**Tasks excluidas de la atenuación**:
+
+| Task | Razón |
+|---|---|
+| `rest_baseline` | Define el propio baseline; atenuarla alteraría la referencia |
+| `noise_other_fingers` | No hay joystick: la señal refleja la amplitud real de los otros dedos tal como aparecerá online |
+| `noise_wrist_grip` | Ídem: la amplitud de la muñeca/grip es la que el joystick percibirá online, sin compensación del resorte |
+
+La atenuación se aplica **a todas las demás tasks** (flexión, extensión, holds, etc.) en el preprocesamiento offline. En inferencia online no se aplica ningún procesamiento: el modelo aprende a generalizar la correspondencia EMG→velocidad para señales de menor amplitud.
+
+El valor de α se determina empíricamente en `notebooks/emg_exploration.ipynb` sobre varias sesiones. Valor usado: **α = 0.5**.

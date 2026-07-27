@@ -13,6 +13,7 @@ Uso:
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import random
 import time
@@ -47,9 +48,27 @@ def parse_args():
                    help="lista de dilataciones (5 valores: 2 bloques residuales + capa final)")
     p.add_argument("--bp-low", type=float, default=70.0,
                    help="frecuencia de corte inferior del bandpass EMG (Hz). Default 70.")
+    p.add_argument("--feature-clip", type=float, default=20.0,
+                   help="clip simetrico aplicado a features tras el pipeline EMG. Default 20.")
+    p.add_argument("--no-feature-clip", action="store_true",
+                   help="desactivar clipping de features (equivale a feature_clip=None). "
+                        "Recomendado con features raw (rms, d_rms) donde el clip puede "
+                        "cortar picos de activacion validos.")
     p.add_argument("--sigma-ms", type=float, default=150.0,
                    help="sigma del gaussiano que suaviza la posicion del joystick antes "
                         "de derivar para sacar la velocidad target. Default 150 ms.")
+    p.add_argument("--adaptive-sigma", type=float, nargs=2, default=None,
+                   metavar=("DEFAULT_MS", "SLOW_MS"),
+                   help="Sigmas adaptativos por task. DEFAULT_MS para fast y resto; "
+                        "SLOW_MS para slow_flex_ind, slow_ext_ind, holds_intermediate_ind, "
+                        "slow_cycles_ind. Si se omite, usa --sigma-ms para todo. "
+                        "Ejemplo: --adaptive-sigma 50 80")
+    p.add_argument("--emg-attenuation", type=float, default=1.0,
+                   help="Alpha de compresion global (flx y ext). 1.0 = sin atenuacion.")
+    p.add_argument("--emg-attenuation-flx", type=float, default=None,
+                   help="Alpha para canales flexor. Sobreescribe --emg-attenuation para flx.")
+    p.add_argument("--emg-attenuation-ext", type=float, default=None,
+                   help="Alpha para canales extensor. Sobreescribe --emg-attenuation para ext.")
     p.add_argument("--features", nargs="+", default=list(DEFAULT_FEATURE_SET),
                    choices=list(ALL_FEATURE_TYPES),
                    help="feature types por canal EMG (default: rms_norm d_rms_norm). "
@@ -102,6 +121,15 @@ def parse_args():
                    help="Epochs sin mejora antes de reducir lr (default 10).")
     p.add_argument("--lr-min", type=float, default=1e-5,
                    help="lr minimo para el scheduler (default 1e-5).")
+    p.add_argument("--joy-center", default="fixed", choices=["fixed", "rest", "median"],
+                   help="Centering del joystick por sesion: fixed=offsets hardcoded (default), "
+                        "rest=mediana durante rest_baseline, median=mediana global.")
+    p.add_argument("--predict-accel", action="store_true",
+                   help="Target primario = aceleracion (d(vel)/dt). "
+                        "y[0]=accel_norm, y[1]=pos_norm. El checkpoint guarda target_scale=accel_scale.")
+    p.add_argument("--predict-pos", action="store_true",
+                   help="Target primario = posicion (joy). "
+                        "y[0]=pos_norm, y[1]=pos_norm. El checkpoint guarda target_scale=pos_scale.")
     p.add_argument("--grad-clip", type=float, default=1.0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--device", default="auto", choices=["auto", "cpu", "mps", "cuda"])
@@ -190,6 +218,18 @@ def harmonize_position_scale(datasets, percentile: float = 99.0) -> float:
     for ds in datasets:
         ds.position = (ds.joy / scale).astype(np.float32)
         ds.position_scale = scale
+    return scale
+
+
+def harmonize_accel_scale(datasets, percentile: float = 99.0) -> float:
+    """Igual que harmonize_target_scale pero para la aceleracion."""
+    all_raw = np.concatenate([np.abs(ds.accel_raw) for ds in datasets])
+    scale = float(np.percentile(all_raw, percentile))
+    if scale <= 0:
+        scale = 1.0
+    for ds in datasets:
+        ds.accel = (ds.accel_raw / scale).astype(np.float32)
+        ds.accel_scale = scale
     return scale
 
 
@@ -490,8 +530,33 @@ def main():
     if args.horizon > 1:
         print(f"Horizon: {args.horizon} timesteps (output K, input extendido a "
               f"{args.window_length + args.horizon - 1})")
-    config = PreprocessConfig(feature_set=tuple(args.features), sigma_ms=args.sigma_ms,
-                              bp_low=args.bp_low)
+    adaptive_sigma_slow = None
+    if args.adaptive_sigma is not None:
+        sigma_default, sigma_slow = args.adaptive_sigma
+        config_sigma = sigma_default
+        adaptive_sigma_slow = sigma_slow
+        print(f"Sigma adaptivo: default={sigma_default} ms, slow tasks={sigma_slow} ms")
+    else:
+        config_sigma = args.sigma_ms
+    attn_flx = args.emg_attenuation_flx
+    attn_ext = args.emg_attenuation_ext
+    attn_global = args.emg_attenuation
+    if attn_flx is not None or attn_ext is not None:
+        print(f"EMG attenuation: flx={attn_flx if attn_flx is not None else attn_global}  "
+              f"ext={attn_ext if attn_ext is not None else attn_global}")
+    elif attn_global < 1.0:
+        print(f"EMG attenuation: alpha={attn_global}")
+    config = PreprocessConfig(
+        feature_set=tuple(args.features),
+        sigma_ms=config_sigma,
+        adaptive_sigma_slow_ms=adaptive_sigma_slow,
+        bp_low=args.bp_low,
+        feature_clip=None if args.no_feature_clip else args.feature_clip,
+        joy_center_mode=args.joy_center,
+        emg_attenuation=attn_global,
+        emg_attenuation_flx=attn_flx,
+        emg_attenuation_ext=attn_ext,
+    )
     datasets = []
     for csv_path in args.csv:
         print(f"  - {csv_path}")
@@ -511,12 +576,30 @@ def main():
             "Inconsistencia de in_channels entre sesiones"
         )
 
-    # Target scale compartido entre sesiones (velocity y position)
+    # Target scale compartido entre sesiones (velocity, position, acceleration)
     shared_scale = harmonize_target_scale(datasets, percentile=99.0)
     shared_pos_scale = harmonize_position_scale(datasets, percentile=99.0)
+    shared_accel_scale = harmonize_accel_scale(datasets, percentile=99.0)
     print(f"\nTarget scale compartido (p99 sobre todas las sesiones):")
     print(f"  velocity: {shared_scale:.4f}")
     print(f"  position: {shared_pos_scale:.4f}")
+    print(f"  accel   : {shared_accel_scale:.4f}")
+
+    # --predict-accel: swap y[0] para que el target primario sea aceleracion.
+    if args.predict_accel:
+        for ds in datasets:
+            ds.target, ds.accel = ds.accel, ds.target
+            ds.target_scale, ds.accel_scale = ds.accel_scale, ds.target_scale
+        shared_scale, shared_accel_scale = shared_accel_scale, shared_scale
+        print(f"  [predict-accel] target primario = aceleracion  (scale={shared_scale:.4f})")
+
+    # --predict-pos: swap y[0] para que el target primario sea posicion (joy).
+    if args.predict_pos:
+        for ds in datasets:
+            ds.target, ds.target_scale = ds.joy.astype(np.float32), ds.position_scale
+        shared_scale = shared_pos_scale
+        print(f"  [predict-pos] target primario = posicion  (scale={shared_scale:.4f})")
+
     use_multitask = args.alpha_pos > 0.0
     output_dim = 2 if use_multitask else 1
     print(f"  task    : {'multi-task (vel + alpha*pos)' if use_multitask else 'single task (vel)'}  "
@@ -676,8 +759,37 @@ def main():
     # ---- Output dir ----
     out_dir = Path(args.output_dir) / args.run_name
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    full_config = {
+        # Todos los args CLI verbatim
+        **vars(args),
+        # Valores resueltos (pueden diferir de los args crudos)
+        "resolved_sigma_ms": config_sigma,
+        "resolved_adaptive_sigma_slow_ms": adaptive_sigma_slow,
+        "resolved_feature_clip": None if args.no_feature_clip else args.feature_clip,
+        # Modelo
+        "model_receptive_field": model.receptive_field,
+        "model_n_params": sum(p.numel() for p in model.parameters() if p.requires_grad),
+        "in_channels": in_channels,
+        "output_dim": output_dim,
+        # Features
+        "feature_names": list(datasets[0].feature_names),
+        "feature_center": feat_center.tolist() if feat_center is not None else None,
+        "feature_scale": feat_scale.tolist() if feat_scale is not None else None,
+        # Datos
+        "fs_mean": float(np.mean([d.fs for d in datasets])),
+        "fs_per_session": {Path(d.csv_path).name: float(d.fs) for d in datasets},
+        "shared_target_scale": float(shared_scale),
+        "shared_position_scale": float(shared_pos_scale),
+        "shared_accel_scale": float(shared_accel_scale),
+        "n_train_windows": len(train_idx),
+        "n_val_windows": len(val_idx),
+        # PreprocessConfig completo (bp_high, bp_order, rms_window_ms, ema_tau_s, etc.)
+        "preprocess_config": dataclasses.asdict(config),
+    }
+
     with open(out_dir / "config.json", "w") as f:
-        json.dump(vars(args), f, indent=2)
+        json.dump(full_config, f, indent=2)
     np.save(out_dir / "val_tasks.npy", val_tasks)
 
     # ---- Training ----
@@ -710,9 +822,10 @@ def main():
             best_epoch = ep
             torch.save({
                 "model_state": model.state_dict(),
-                "config": vars(args),
+                "config": full_config,
                 "epoch": ep,
                 "val_metrics": val_metrics,
+                # Campos de alto nivel para compatibilidad con visualize.py
                 "target_scale": shared_scale,
                 "position_scale": shared_pos_scale,
                 "alpha_pos": args.alpha_pos,
@@ -728,6 +841,10 @@ def main():
                 "feature_norm": args.feature_norm,
                 "feature_center": feat_center.tolist() if feat_center is not None else None,
                 "feature_scale": feat_scale.tolist() if feat_scale is not None else None,
+                "feature_clip": None if args.no_feature_clip else args.feature_clip,
+                "joy_center_mode": args.joy_center,
+                "predict_accel": args.predict_accel,
+                "predict_pos": args.predict_pos,
             }, out_dir / "best.pt")
             np.savez(
                 out_dir / "best_val_preds.npz",

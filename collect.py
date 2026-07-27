@@ -9,7 +9,7 @@ Uso:
 import argparse
 from pathlib import Path
 
-from collection.protocols import mini_protocol, protocol_1finger, protocol_free_eval
+from collection.protocols import mini_protocol, protocol_1finger, protocol_1finger_noise, protocol_free_eval
 from collection.runner import run_session
 
 
@@ -27,8 +27,9 @@ def main():
     p.add_argument("--port", default="/dev/cu.usbserial-2110")
     p.add_argument("--baud", type=int, default=1000000,
                    help="baud rate (default 1000000 para Arduino; 2000000 para ESP32)")
-    p.add_argument("--protocol", choices=["auto", "1finger", "free-eval"], default="auto",
+    p.add_argument("--protocol", choices=["auto", "1finger", "1finger-noise", "free-eval"], default="auto",
                    help="protocolo: auto=segun session_number, 1finger=solo indice (~14 min), "
+                        "1finger-noise=solo indice + distractores (~16 min), "
                         "free-eval=rest 15s + free_controlled 100s (~2 min, solo evaluacion)")
     p.add_argument("--output-dir", default="data/raw", type=Path)
     p.add_argument("--notes", default=None)
@@ -57,6 +58,9 @@ def main():
     elif args.protocol == "1finger":
         blocks_override = protocol_1finger()
         print("\n[1FINGER] Protocolo solo-indice (~14 min).\n")
+    elif args.protocol == "1finger-noise":
+        blocks_override = protocol_1finger_noise()
+        print("\n[1FINGER-NOISE] Protocolo solo-indice con distractores (~16 min).\n")
     elif args.protocol == "free-eval":
         blocks_override = protocol_free_eval()
         print("\n[FREE-EVAL] Protocolo de evaluacion: rest 15s + free_controlled 100s. "

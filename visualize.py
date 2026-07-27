@@ -113,103 +113,6 @@ class _SerialStream:
         try: self.ser.close()
         except Exception: pass
 
-
-class _MockStream:
-    def __init__(self, fs: float = 606.0):
-        self.fs  = fs
-        self.dt  = 1.0 / fs
-        self.t0  = time.monotonic()
-        self.n   = 0
-        self.rng = np.random.default_rng(0)
-        self._ph = self.rng.random(4) * 2 * np.pi
-
-    def read(self) -> Optional[np.ndarray]:
-        t_now = time.monotonic() - self.t0
-        if int(t_now * self.fs) <= self.n:
-            return None
-        self.n += 1
-        t = self.n * self.dt
-        env  = np.array([0.5 * (1 + np.sin(2*np.pi*0.4*t + self._ph[i])) for i in range(4)])
-        emg  = (env * 2000 * self.rng.standard_normal(4)).clip(-8388607, 8388607)
-        joy  = 512 + 480 * np.sin(2*np.pi * np.array([0.3, 0.3, 0.25, 0.25]) * t
-                                  + np.array([0, np.pi, 0.5, 0.5+np.pi]))
-        return np.array([*emg, *joy], dtype=np.float32)
-
-    def close(self): pass
-
-
-# ── Online feature pipeline ───────────────────────────────────────────────────
-
-class _OnlineBandpass:
-    def __init__(self, fs: float, low=70.0, high=300.0, order=4):
-        nyq = fs / 2.0
-        self.sos = butter(order, [low/nyq, min(high, nyq*0.95)/nyq],
-                          btype="bandpass", output="sos")
-        self.zi = sosfilt_zi(self.sos) * 0.0
-
-    def push(self, x: float) -> float:
-        from scipy.signal import sosfilt
-        y, self.zi = sosfilt(self.sos, np.array([x]), zi=self.zi)
-        return float(y[0])
-
-
-class _OnlineRMS:
-    def __init__(self, fs: float, window_ms: float):
-        win = max(1, int(round(window_ms / 1000.0 * fs)))
-        self.buf   = collections.deque([0.0]*win, maxlen=win)
-        self.sum_sq = 0.0
-        self.count  = 0
-        self.win    = win
-
-    def push(self, x: float) -> float:
-        old = self.buf[0]
-        self.sum_sq += x*x - old*old
-        self.buf.append(x)
-        self.count = min(self.count + 1, self.win)
-        return float(np.sqrt(max(0.0, self.sum_sq) / self.count))
-
-
-class _OnlineEMA:
-    def __init__(self, fs: float, tau_s: float = 1.0, eps: float = 1e-6):
-        self.alpha = 1.0 - float(np.exp(-1.0/(fs*tau_s)))
-        self.state = None
-        self.eps   = eps
-
-    def normalize(self, x: float) -> float:
-        self.state = x if self.state is None else (self.alpha*x + (1-self.alpha)*self.state)
-        return x / (self.state + self.eps)
-
-
-class _OnlineChannelPipeline:
-    """raw → BP → RMS(fast+slow)/EMA. Emite features en el mismo orden que training."""
-
-    def __init__(self, fs: float, feature_set: list[str]):
-        self.fs         = fs
-        self.feature_set = feature_set
-        self.bp         = _OnlineBandpass(fs)
-        self.rms_f      = _OnlineRMS(fs, 40.0)
-        self.rms_s      = _OnlineRMS(fs, 150.0)
-        self.ema_f      = _OnlineEMA(fs, 1.0)
-        self.ema_s      = _OnlineEMA(fs, 1.0)
-        self._prev_f    = 0.0
-        self._prev_s    = 0.0
-
-    def push(self, raw: float) -> np.ndarray:
-        bp = self.bp.push(raw)
-        out = []
-        if "rms_norm" in self.feature_set or "d_rms_norm" in self.feature_set:
-            rn = self.ema_f.normalize(self.rms_f.push(abs(bp)))
-            drn = rn - self._prev_f;  self._prev_f = rn
-            if "rms_norm"   in self.feature_set: out.append(rn)
-            if "d_rms_norm" in self.feature_set: out.append(drn)
-        if "rms_slow_norm" in self.feature_set or "d_rms_slow_norm" in self.feature_set:
-            rsn = self.ema_s.normalize(self.rms_s.push(abs(bp)))
-            drsn = rsn - self._prev_s;  self._prev_s = rsn
-            if "rms_slow_norm"   in self.feature_set: out.append(rsn)
-            if "d_rms_slow_norm" in self.feature_set: out.append(drsn)
-        return np.array(out, dtype=np.float32)
-
-
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--checkpoint", required=True)
@@ -230,15 +133,15 @@ def parse_args():
                    help="start time in seconds")
     p.add_argument("--duration", type=float, default=None,
                    help="duration in seconds; default = whole session")
-    p.add_argument("--leak-tau", type=float, default=5.0,
+    p.add_argument("--leak-tau", type=float, default=0.0,
                    help="leaky integrator time constant (s); smaller = mas anclaje a 0. "
-                        "0 (o negativo) = sin leak, integracion pura + clipping fisico")
-    p.add_argument("--vel-smooth-tau", type=float, default=0.05,
+                        "0 (default) = sin leak, integracion cinematica pura + clipping fisico")
+    p.add_argument("--vel-smooth-tau", type=float, default=0.01,
                    help="EMA tau (s) para suavizar la velocidad predicha antes de integrar; "
                         "0 = sin smoothing")
-    p.add_argument("--dead-zone", type=float, default=None,
+    p.add_argument("--dead-zone", type=float, default=0.0,
                    help="threshold (en unidades de velocidad raw) abajo del cual v_pred = 0. "
-                        "default: auto = p95 de |v| durante rest_baseline")
+                        "0 (default) = sin dead zone.")
     p.add_argument("--save", default=None,
                    help="path para guardar como mp4/gif (requiere ffmpeg/imagemagick)")
     return p.parse_args()
@@ -376,6 +279,19 @@ def process_finger_velocity(pred_raw, fs, dt, args, tasks, true_position,
     return pred_velocity, pred_position, dead_zone_thr
 
 
+def process_finger_position(pred_raw, fs, dt, position_scale, joy_center, smooth_tau=0.0):
+    """Para modelos predict_pos: la salida ya es posicion normalizada.
+    Devuelve (pred_velocity, pred_position) — sin integracion."""
+    from dataset.preprocessing import central_diff as _central_diff, causal_ema
+    warmup_samples = int(round(fs * 1.0))
+    pred_position = pred_raw * position_scale - joy_center
+    pred_position[:warmup_samples] = 0.0
+    if smooth_tau > 0:
+        pred_position = causal_ema(pred_position, fs, tau_s=smooth_tau).astype(np.float32)
+    pred_velocity = _central_diff(pred_position, dt=dt)
+    return pred_velocity, pred_position
+
+
 def build_box_panel(ax, title, p_low, p_high, margin, start_position_true,
                     start_position_pred):
     """Arma una cajita vertical con 2 circulos (real verde / pred rojo).
@@ -415,8 +331,8 @@ def build_box_panel(ax, title, p_low, p_high, margin, start_position_true,
             "y_lim": y_lim, "box_patch": box}
 
 
-def build_velocity_panel(ax, title, fs, v_lim):
-    """Velocidad scrolling con 2 lineas. Devuelve dict con buffers + lineas."""
+def build_velocity_panel(ax, title, fs, v_lim, ylabel="vel (joy/s)"):
+    """Señal scrolling con 2 lineas. Devuelve dict con buffers + lineas."""
     vel_buf_len = int(5.0 * fs)
     real_buf = np.zeros(vel_buf_len)
     pred_buf = np.zeros(vel_buf_len)
@@ -424,7 +340,7 @@ def build_velocity_panel(ax, title, fs, v_lim):
 
     ax.set_xlim(-5, 0); ax.set_ylim(*v_lim)
     ax.set_xlabel("t (s, relativo a ahora)")
-    ax.set_ylabel("vel (joy/s)")
+    ax.set_ylabel(ylabel)
     if title:
         ax.set_title(title, fontsize=9)
     ax.axhline(0, color="gray", lw=0.5, linestyle="--", zorder=1)
@@ -459,7 +375,16 @@ def run_live(args):
     features = cfg.get("features") or list(DEFAULT_FEATURE_SET)
     sigma_ms = float(cfg.get("sigma_ms", 50.0))
     window_len = cfg["window_length"]
-    print(f"Modo live — {mode} dedo(s)  |  features={features}  |  fs={fs:.0f} Hz  |  sigma={sigma_ms}ms")
+    # resolved_feature_clip es el valor real usado en entrenamiento (None = sin clip).
+    # cfg["feature_clip"] es el default del argparse (20.0) y NO es confiable cuando
+    # se uso --no-feature-clip; usar siempre resolved_feature_clip primero.
+    _raw_clip = cfg.get("resolved_feature_clip", ckpt.get("feature_clip"))
+    feat_clip = float(_raw_clip) if _raw_clip is not None else None
+
+    predict_accel = bool(ckpt.get("predict_accel", False))
+    _tgt_label = "accel" if predict_accel else "vel"
+    print(f"Modo live — {mode} dedo(s)  |  features={features}  |  fs={fs:.0f} Hz  |  sigma={sigma_ms}ms  "
+          f"|  feat_clip={feat_clip}  |  target={_tgt_label}")
 
     # Buffer crudo: 10s para que la EMA (tau=1s) esté inicializada al leer el extremo
     HISTORY_N = max(window_len, int(10.0 * fs))
@@ -479,18 +404,19 @@ def run_live(args):
 
     # Estado del leaky integrator de posición predicha
     pos_state = [0.0] * mode
+    # Para predict_accel: buffer de velocidad integrada desde aceleración
+    accel_vel_state = [0.0] * mode
 
     # Stream
     if args.port:
         stream = _SerialStream(args.port, baud=args.baud)
         print(f"Serial: {args.port} @ {args.baud} bps")
     else:
-        stream = _MockStream(fs=fs)
-        print("Mock stream (sin hardware)")
+        exit(0)
 
     # ── Paneles: Arduino 10-bit, joy 0-1023, centro ~512
     # Posicion = -(joy_ext - 512) + -(joy_flex - 512), rango real ≈ ±512
-    p_low, p_high, margin = -600.0, 600.0, 80.0
+    p_low, p_high, margin = -300.0, 300.0, 40.0
     v_amp = max(target_scales)   # target_scale = max vel de entrenamiento
 
     # Dead zone auto-calibrada desde los primeros 3s de predicciones (asume reposo inicial)
@@ -558,6 +484,9 @@ def run_live(args):
             fi, _ = compute_emg_features(_arr("emg1"), _arr("emg0"), fs, feature_set=features)
             fm, _ = compute_emg_features(_arr("emg3"), _arr("emg2"), fs, feature_set=features)
             feats = np.concatenate([fi, fm], axis=0)  # [C, T]
+        # Clip identico al de entrenamiento (None = sin clip).
+        if feat_clip is not None and feat_clip > 0:
+            np.clip(feats, -feat_clip, feat_clip, out=feats)
 
         # ── Pred: predict_full_sequence sobre los últimos window_len+new_samples ──
         n_ctx = window_len + new_samples
@@ -591,11 +520,11 @@ def run_live(args):
             true_pos[1] = float(joy_med[-1])
             true_vel[1]  = vel_med[-new_samples:]
 
-        # ── Pred velocity: warmup mask + EMA persistente + dead zone ───────────
+        # ── Pred velocity/position: warmup mask + EMA persistente + dead zone ───
         pred_vel = np.zeros((mode, new_samples))
-        # Warmup: igual que replay (zeroa primeros 1s para que la EMA arranque limpia)
         warmup_done = real_samples[0] > int(fs * 1.0)
-        dz = float(args.dead_zone) if args.dead_zone else dz_state["value"]
+        use_auto_dz = args.dead_zone is None
+        dz = dz_state["value"] if use_auto_dz else float(args.dead_zone)
         for i in range(mode):
             v_raw = pred_raw_arr[i] * target_scales[i]
             if i == 1:
@@ -607,14 +536,14 @@ def run_live(args):
             for t, vt in enumerate(v_raw):
                 pred_ema_state[i] = pred_ema_alpha * float(vt) + (1 - pred_ema_alpha) * pred_ema_state[i]
                 v_smooth[t] = pred_ema_state[i]
-            # Acumular para calibrar dead zone en los primeros 3s
-            if not dz_state["computed"]:
-                pred_vel_warmup[i].extend(v_smooth.tolist())
-            v_smooth = apply_dead_zone(v_smooth, dz)
+            if not predict_accel:
+                if use_auto_dz and not dz_state["computed"]:
+                    pred_vel_warmup[i].extend(v_smooth.tolist())
+                v_smooth = apply_dead_zone(v_smooth, dz)
             pred_vel[i] = v_smooth
 
         # Auto dead zone: p95 de las pred vel en los primeros 3s (asume reposo)
-        if not dz_state["computed"] and real_samples[0] >= DZ_WARMUP_N:
+        if use_auto_dz and not dz_state["computed"] and real_samples[0] >= DZ_WARMUP_N:
             all_vels = []
             for wup in pred_vel_warmup:
                 all_vels.extend(wup)
@@ -644,13 +573,25 @@ def run_live(args):
         real_samples[0] += new_samples
         true_pos, true_vel, pred_vel = _compute_frame(new_samples)
 
-        # Leaky integrar posición predicha muestra a muestra
+        # Posición predicha: integración cinemática directa (x(t) = x(t-1) + v(t)*dt)
+        # Si leak_tau > 0 se aplica decay exponencial para amortiguar drift.
         leak = dt / args.leak_tau if args.leak_tau > 0 else 0.0
         for i in range(mode):
-            for v in pred_vel[i]:
+            if predict_accel:
+                # Doble integración cinemática: accel → vel → pos
+                for a in pred_vel[i]:
+                    accel_vel_state[i] += float(a) * dt
+                    if leak > 0:
+                        accel_vel_state[i] *= (1 - leak)
                 pos_state[i] = np.clip(
-                    pos_state[i] * (1 - leak) + float(v) * dt,
+                    pos_state[i] + accel_vel_state[i] * dt,
                     p_low, p_high)
+            else:
+                # Integración cinemática: pos += vel * dt (pura, sin amortiguamiento)
+                for v in pred_vel[i]:
+                    pos_state[i] = np.clip(
+                        pos_state[i] + float(v) * dt,
+                        p_low, p_high)
 
             ba = box_artists[i]
             ba["true_circle"].center = (-0.35, float(true_pos[i]))
@@ -692,21 +633,31 @@ def main():
     model, ckpt = load_model(args.checkpoint, device)
     cfg = ckpt["config"]
     mode = detect_mode(ckpt)
-    print(f"Modo: {mode} dedo(s)")
+    predict_pos = bool(cfg.get("predict_pos", False))
+    print(f"Modo: {mode} dedo(s)  |  predict_pos={predict_pos}")
 
     # ----- Cargar dataset segun modo -----
     ckpt_sigma = float(cfg.get("sigma_ms", 50.0 if mode == 2 else 150.0))
     if mode == 1:
         ckpt_features = cfg.get("features") or list(DEFAULT_FEATURE_SET)
+        ckpt_joy_center = ckpt.get("joy_center_mode") or cfg.get("joy_center_mode") or "fixed"
         ds = EMGSessionDataset(
             args.csv,
             window_length=cfg["window_length"],
             stride=1,
             config=PreprocessConfig(feature_set=tuple(ckpt_features),
-                                    sigma_ms=ckpt_sigma),
+                                    sigma_ms=ckpt_sigma,
+                                    feature_clip=float(ckpt.get("feature_clip") or 20.0),
+                                    joy_center_mode=ckpt_joy_center),
             verbose=False,
         )
         target_scales = {"single": float(ckpt["target_scale"])}
+        # Para predict_pos, target_scale guarda la escala de posicion (legacy swap).
+        # Para modelos normales, position_scale guarda la escala de posicion.
+        if predict_pos:
+            position_scales = {"single": float(ckpt["target_scale"])}
+        else:
+            position_scales = {"single": float(ckpt.get("position_scale", ds.position_scale))}
         _joy_raw = ds.joy.astype(np.float64)
         _rest = ds.tasks == "rest_baseline"
         _joy_center = float(np.median(_joy_raw[_rest])) if _rest.any() else float(np.median(_joy_raw))
@@ -798,15 +749,27 @@ def main():
     # ----- Pipeline post-inferencia por dedo -----
     for f in fingers:
         ts = target_scales[f["key"]]
-        pv, pp, dz = process_finger_velocity(
-            preds_norm[f["pred_idx"]], fs, dt, args,
-            tasks=ds.tasks, true_position=f["true_position"],
-            target_scale=ts,
-        )
-        f["pred_velocity"] = pv
-        f["pred_position"] = pp
-        f["target_scale"] = ts
-        print(f"  {f['label']}: target_scale={ts:.2f}, dead_zone={dz:.2f}")
+        if predict_pos:
+            ps = position_scales[f["key"]]
+            pv, pp = process_finger_position(
+                preds_norm[f["pred_idx"]], fs, dt,
+                position_scale=ps, joy_center=_joy_center,
+                smooth_tau=args.vel_smooth_tau,
+            )
+            f["pred_velocity"] = pv
+            f["pred_position"] = pp
+            f["target_scale"] = ts
+            print(f"  {f['label']}: position_scale={ps:.2f}  (predict_pos mode)")
+        else:
+            pv, pp, dz = process_finger_velocity(
+                preds_norm[f["pred_idx"]], fs, dt, args,
+                tasks=ds.tasks, true_position=f["true_position"],
+                target_scale=ts,
+            )
+            f["pred_velocity"] = pv
+            f["pred_position"] = pp
+            f["target_scale"] = ts
+            print(f"  {f['label']}: target_scale={ts:.2f}, dead_zone={dz:.2f}")
 
     # ----- Ventana temporal -----
     start_sample = max(0, int(args.start * fs))
@@ -841,9 +804,9 @@ def main():
             fa["box"], f["label"], p_low, p_high, margin,
             float(tp[start_sample]), float(f["pred_position"][start_sample]),
         )
-        v_amp = float(np.percentile(np.abs(f["true_velocity"]), 99))
+        p_amp = float(np.percentile(np.abs(f["true_position"]), 99))
         f["vel_artists"] = build_velocity_panel(
-            fa["vel"], None, fs, (-v_amp * 1.2, v_amp * 1.2),
+            fa["vel"], None, fs, (-p_amp * 1.2, p_amp * 1.2), ylabel="position (joy)",
         )
 
     # Status text (compartido)
@@ -876,10 +839,11 @@ def main():
 
         for f in fingers:
             ba = f["box_artists"]; va = f["vel_artists"]
-            ba["true_circle"].center = (-0.35, float(f["true_position"][sample]))
-            ba["pred_circle"].center = (+0.35, float(f["pred_position"][sample]))
-            new_real = f["true_velocity"][max(0, sample - spf + 1): sample + 1]
-            new_pred = f["pred_velocity"][max(0, sample - spf + 1): sample + 1]
+            y_lo, y_hi = ba["y_lim"]
+            ba["true_circle"].center = (-0.35, float(np.clip(f["true_position"][sample], y_lo, y_hi)))
+            ba["pred_circle"].center = (+0.35, float(np.clip(f["pred_position"][sample], y_lo, y_hi)))
+            new_real = f["true_position"][max(0, sample - spf + 1): sample + 1]
+            new_pred = f["pred_position"][max(0, sample - spf + 1): sample + 1]
             k = len(new_real)
             if k > 0:
                 va["real_buf"][:-k] = va["real_buf"][k:]

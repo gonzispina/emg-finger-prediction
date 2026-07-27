@@ -15,6 +15,7 @@ from torch.utils.data import Dataset
 
 from .preprocessing import (
     DEFAULT_FEATURE_SET,
+    central_diff,
     compute_emg_features,
     compute_target_velocity,
     estimate_fs,
@@ -25,8 +26,15 @@ from .preprocessing import (
 class PreprocessConfig:
     # Target
     sigma_ms: float = 150.0
+    # Sigma adaptivo por task (None = usar sigma_ms para todo)
+    # slow tasks (slow_flex_ind, slow_ext_ind, holds_intermediate_ind, slow_cycles_ind)
+    adaptive_sigma_slow_ms: Optional[float] = None
     top_offset: float = 500.0
     bottom_offset: float = 550.0
+    # Centering del joystick: "fixed" usa top/bottom_offset hardcoded;
+    # "rest" usa mediana durante task rest_baseline (o mediana global si no hay);
+    # "median" siempre usa mediana global.
+    joy_center_mode: str = "fixed"
     # EMG features
     bp_low: float = 70.0
     bp_high: float = 300.0
@@ -38,6 +46,12 @@ class PreprocessConfig:
     ssc_threshold_rel: float = 0.1
     ema_tau_s: float = 1.0
     feature_set: Tuple[str, ...] = DEFAULT_FEATURE_SET
+    # Atenuacion EMG: comprime picos de RMS sobre el baseline de rest_baseline.
+    # 1.0 = sin atenuacion. Aplica a todas las tasks excepto rest_baseline y noise_*.
+    # emg_attenuation_flx / _ext sobreescriben emg_attenuation para cada musculo.
+    emg_attenuation: float = 1.0
+    emg_attenuation_flx: Optional[float] = None
+    emg_attenuation_ext: Optional[float] = None
     # Normalizacion
     target_scale: Optional[float] = None
     target_scale_percentile: float = 99.0
@@ -117,13 +131,48 @@ class EMGSessionDataset(Dataset):
         flexor = df["emg1"].to_numpy()
         extensor = df["emg0"].to_numpy()
 
+        tasks_col = df["task"].to_numpy()
+
+        # Offsets del joystick: fijos o dinámicos por sesión
+        jcm = self.config.joy_center_mode
+        if jcm == "fixed":
+            top_offset    = self.config.top_offset
+            bottom_offset = self.config.bottom_offset
+        else:
+            rest_mask = tasks_col == "rest_baseline"
+            if jcm == "rest" and rest_mask.any():
+                top_offset    = float(np.median(y_top[rest_mask]))
+                bottom_offset = float(np.median(y_bottom[rest_mask]))
+            else:
+                top_offset    = float(np.median(y_top))
+                bottom_offset = float(np.median(y_bottom))
+
         joy, velocity = compute_target_velocity(
             y_top, y_bottom,
             fs=self.fs,
             sigma_ms=self.config.sigma_ms,
-            top_offset=self.config.top_offset,
-            bottom_offset=self.config.bottom_offset,
+            top_offset=top_offset,
+            bottom_offset=bottom_offset,
         )
+
+        # Sigma adaptivo por task: slow tasks reciben un sigma mas grande para
+        # suavizar el stick-slip del joystick sin perder amplitud.
+        _SLOW_TASKS = frozenset({
+            "slow_flex_ind", "slow_ext_ind", "holds_intermediate_ind", "slow_cycles_ind",
+        })
+        if self.config.adaptive_sigma_slow_ms is not None:
+            sigma_slow = self.config.adaptive_sigma_slow_ms
+            if sigma_slow != self.config.sigma_ms:
+                _, vel_slow = compute_target_velocity(
+                    y_top, y_bottom,
+                    fs=self.fs,
+                    sigma_ms=sigma_slow,
+                    top_offset=top_offset,
+                    bottom_offset=bottom_offset,
+                )
+                slow_mask = np.isin(tasks_col, list(_SLOW_TASKS))
+                velocity[slow_mask] = vel_slow[slow_mask]
+
         feats, feat_labels = compute_emg_features(
             flexor, extensor,
             fs=self.fs,
@@ -139,6 +188,39 @@ class EMGSessionDataset(Dataset):
             ema_tau_s=self.config.ema_tau_s,
         )
         self.feature_names = tuple(feat_labels)
+
+        # Atenuacion EMG: comprime picos de RMS sobre el baseline por sesion.
+        # baseline = mediana del RMS durante los ultimos 10 s de rest_baseline.
+        # Si emg_attenuation_flx/_ext estan definidos, se usan por canal;
+        # si no, se usa emg_attenuation global.
+        _SKIP_ATTN = frozenset({"rest_baseline", "noise_other_fingers", "noise_wrist_grip"})
+        alpha_flx = self.config.emg_attenuation_flx
+        alpha_ext = self.config.emg_attenuation_ext
+        alpha_global = self.config.emg_attenuation
+        _any_attn = (
+            (alpha_flx is not None and alpha_flx < 1.0)
+            or (alpha_ext is not None and alpha_ext < 1.0)
+            or (alpha_flx is None and alpha_ext is None and alpha_global < 1.0)
+        )
+        if _any_attn:
+            rest_idx = np.where(tasks_col == "rest_baseline")[0]
+            if len(rest_idx) > 0:
+                last10_mask = rest_idx >= rest_idx[-1] - int(10.0 * self.fs)
+                last10_idx = rest_idx[last10_mask]
+                attn_mask = ~np.isin(tasks_col, list(_SKIP_ATTN))
+                for c, name in enumerate(feat_labels):
+                    if "flx" in name:
+                        alpha = alpha_flx if alpha_flx is not None else alpha_global
+                    else:
+                        alpha = alpha_ext if alpha_ext is not None else alpha_global
+                    if alpha >= 1.0:
+                        continue
+                    baseline_c = float(np.median(feats[c, last10_idx]))
+                    feats[c, attn_mask] = np.where(
+                        feats[c, attn_mask] > baseline_c,
+                        baseline_c + (feats[c, attn_mask] - baseline_c) * alpha,
+                        feats[c, attn_mask],
+                    )
 
         # Normalizacion de target — escala robusta por percentil 99 si no se da
         if self.config.target_scale is None:
@@ -157,15 +239,23 @@ class EMGSessionDataset(Dataset):
         self.position_scale = pos_scale
         position_norm = (joy / pos_scale).astype(np.float32)
 
+        # Acceleration target: d(velocity)/dt (central diff para simetria con velocity)
+        accel_raw = central_diff(velocity, dt=1.0 / self.fs)
+        accel_scale = float(np.percentile(np.abs(accel_raw), self.config.target_scale_percentile))
+        if accel_scale <= 0:
+            accel_scale = 1.0
+        self.accel_scale = accel_scale
+        self.accel_raw = accel_raw.astype(np.float32)
+        self.accel = (accel_raw / accel_scale).astype(np.float32)
+
         # Clipping opcional de features para acotar spikes del /EMA
         if self.config.feature_clip is not None:
             np.clip(feats, -self.config.feature_clip, self.config.feature_clip, out=feats)
 
         # Mascara de samples validos para SUPERVISION (last sample de la ventana).
-        tasks = df["task"].to_numpy()
         valid = np.ones(len(df), dtype=bool)
         for t in self.exclude_tasks:
-            valid &= tasks != t
+            valid &= tasks_col != t
         # Tambien evitar muestras durante el warm-up del bandpass/RMS/EMA (~1s)
         warmup = int(round(self.fs * 1.0))
         valid[:warmup] = False
@@ -189,7 +279,7 @@ class EMGSessionDataset(Dataset):
         self.target_raw = velocity.astype(np.float32)   # [T] velocity pre-normalizacion
         self.position = position_norm                   # [T] position normalizada (joy/pos_scale)
         self.joy = joy.astype(np.float32)               # [T] position smoothed (sin normalizar)
-        self.tasks = tasks
+        self.tasks = tasks_col
         self.indices = last_indices.astype(np.int64)
 
         n_ch = self.features.shape[0]

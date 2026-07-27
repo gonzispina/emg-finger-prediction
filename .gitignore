@@ -22,8 +22,9 @@ data_for_cleaning*.csv
 # Modelos entrenados
 checkpoints/
 
-# Plots / outputs intermedios
-plots/
+# Plots / outputs intermedios (PNG/outputs, no scripts)
+plots/*.png
+plots/*.pdf
 
 # IDE / OS
 .DS_Store

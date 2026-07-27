@@ -67,7 +67,7 @@ def main():
         kernel_size=cfg["kernel_size"],
         dropout=cfg["dropout"],
         dilations=cfg["dilations"],
-        use_weight_norm=False,
+        use_weight_norm=not cfg.get("no_weight_norm", False),
     ).to(device).eval()
     model.load_state_dict(ckpt["model_state"])
 

@@ -266,6 +266,37 @@ def protocol_1finger() -> List[Block]:
     ]
 
 
+def protocol_1finger_noise() -> List[Block]:
+    """Protocolo solo-indice CON distractores (noise_other_fingers + noise_wrist_grip). ~16 min.
+    Mismo orden que protocol_1finger pero con bloques de ruido antes del free_controlled."""
+    return [
+        Block(TASK_REST, 90,
+              "Mano relajada sobre la mesa. No contraigas nada."),
+        Block(TASK_SLOW_FLEX_IND, 75,
+              "Flexiona el INDICE MUY lento (~3 s recorrido completo) y solta."),
+        Block(TASK_SLOW_EXT_IND, 100,
+              "Extiende el INDICE MUY lento (~3 s) y solta."),
+        Block(TASK_SLOW_CYCLES_IND, 100,
+              "Ciclos continuos flex<->ext lentos del INDICE (~0.25 Hz). Sin pausas.",
+              cue="Metronomo a 0.25 Hz si tenes."),
+        Block(TASK_FAST_FLEX_IND, 50,
+              "Flexion rapida del INDICE y volve. ~2 s entre repeticiones."),
+        Block(TASK_FAST_EXT_IND, 100,
+              "Extension rapida del INDICE y volve. ~2 s entre repeticiones."),
+        Block(TASK_HOLDS_IND, 90,
+              "Manten el INDICE en 25 %, 50 %, 75 % del rango (~4 s c/u). Rota entre las tres.",
+              cue="Marca visual de target si tenes."),
+        Block(TASK_MICRO_IND, 70,
+              "Microcorrecciones de 5-10 % del rango del INDICE alrededor de la mitad."),
+        Block(TASK_NOISE_FINGERS, 100,
+              "NO muevas el indice. Mueve pulgar, anular, menique uno por vez."),
+        Block(TASK_NOISE_WRIST, 100,
+              "NO muevas el indice. Flex/ext de muneca, pronacion, agarre con los otros dedos."),
+        Block(TASK_FREE_IND, 50,
+              "INDICE libre, mezcla velocidades y posiciones. Cubri todo el rango."),
+    ]
+
+
 def protocol_free_eval() -> List[Block]:
     """Sesion de evaluacion: rest corto + free_controlled puro. ~115 s."""
     return [
