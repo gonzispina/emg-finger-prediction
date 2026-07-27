@@ -1293,6 +1293,150 @@ rendimiento cuando el placement es consistente.
 re-entrenar ante cualquier reposicionamiento significativo. Con >4 sesiones del
 mismo placement el modelo raw RMS supera al EMA.
 
+### 10.10 Champion actual — h48, sesiones S02–S14, adaptive sigma + atenuación EMG
+
+#### Motivación
+
+Los modelos sobolev/nosobolev (§10.9) entrenados sobre S02–S11 no generalizaban
+movimientos lentos en inferencia online. Evaluados sobre S13 sin atenuación
+tampoco mejoraban. Se decidió ampliar el conjunto de sesiones, aumentar la
+capacidad del modelo e introducir dos técnicas nuevas: sigma adaptivo por task
+y atenuación de la señal EMG durante training.
+
+#### Calidad de sesiones por hardware
+
+Todas las sesiones con Arduino Uno (ADC 10 bits, valores ~500±50 ADC):
+
+| Sesión | Estado | Notas |
+|--------|--------|-------|
+| S02, S03 | Buena | flx range ≈ 154 ADC — señal fuerte |
+| S04–S07  | **Incompatible** | ADS1256 24-bit, valores en 100k+ ADC — excluir del training |
+| S08–S12 | Buena | señal consistente |
+| S13 | Débil (flexor) | flx range ≈ 5 ADC (casi muerto). El sujeto hizo movimientos más lentos y controlados esa sesión. Incluida en training pero aporta ruido. |
+| S14 | Débil (flexor) | flx range ≈ 17 ADC. Mismo electrodo que S13. Incluida. |
+
+**Métrica de calidad**: rango ADC de `emg1` (flexor) por encima del baseline de reposo.
+Los valores S04–S07 son órdenes de magnitud distintos y producen R² ≈ 0 en cualquier
+modelo Arduino — no hay compatibilidad sin normalización específica por hardware.
+
+#### Sigma adaptivo por task
+
+El sigma gaussiano del smoothing del target (§4.2) varía según la velocidad
+típica de la task:
+
+| sigma_ms | Tasks |
+|----------|-------|
+| **80 ms** | `slow_flex_ind`, `slow_ext_ind`, `holds_intermediate_ind`, `slow_cycles_ind` |
+| **50 ms** | todas las demás (`fast_*`, `micro*`, `free_controlled`, `noise_*`, `rest_baseline`) |
+
+Flags: `--sigma-ms 50 --adaptive-sigma-slow-ms 80`.
+> **No existe `--adaptive-sigma`** — ese flag no está implementado. Los dos flags
+> correctos son `--sigma-ms` y `--adaptive-sigma-slow-ms`.
+
+#### Atenuación EMG (training only)
+
+El joystick a resorte obliga al sujeto a ejercer más fuerza que en uso real
+(online no hay joystick). Para compensar se comprimen los picos EMG durante
+training:
+
+```
+rms_compressed[t] = rms[t]                                 si rms[t] ≤ baseline
+rms_compressed[t] = baseline + (rms[t] - baseline) * α     si rms[t] > baseline
+```
+
+`baseline` = mediana del RMS en los últimos 10 s de `rest_baseline` de esa sesión.
+`α = 0.4` para ambos canales (flexor y extensor).
+
+**Solo se aplica en training.** En eval offline y en inferencia online, las features
+se computan sin atenuación. El modelo aprende el mapeo hacia señales de menor amplitud,
+que son las que verá en tiempo real.
+
+Tasks excluidas de la atenuación: `rest_baseline`, `noise_other_fingers`, `noise_wrist_grip`
+(en esos bloques el joystick no introduce sesgo de fuerza o define el baseline).
+
+Flags: `--emg-attenuation-flx 0.4 --emg-attenuation-ext 0.4`.
+
+#### Arquitectura (h48)
+
+| Parámetro | Valor |
+|-----------|-------|
+| `hidden_channels` | **48** (vs 32 de versiones previas) |
+| `kernel_size` | 3 |
+| `dilations` | `[1, 3, 9, 27, 81, 162]` |
+| RF | `1 + 2 × (1+3+9+27+81+162) = 567 samples ≈ 935 ms` |
+| `dropout` | 0.1 |
+| `in_channels` | 8 (rms/d_rms/rms_slow/d_rms_slow × flx/ext) |
+| `output_dim` | 1 |
+| **Parámetros totales** | **36,769** |
+
+#### Feature clip
+
+`--feature-clip 300` (vs ±20 del clip original en ADC o ±200 de modelos previos).
+Los features raw RMS tienen unidades ADC (0–1023), por lo que el clip útil es
+mucho más alto que con features normalizadas.
+
+#### Resultados (val holdout, best epoch)
+
+Checkpoint: `tcn_s02s03s08s09s10s11s12s13s14_rawrms_RF567_h48_adapsig50_80_attn04_clip300_plateau_100ep`
+
+| Métrica | Valor |
+|---------|-------|
+| Best epoch | 93 |
+| Val R² (pooled) | **0.688** |
+| Val Pearson | **0.830** |
+
+Desglose por task (val holdout, mean per-task):
+
+| task | R² | Pearson |
+|------|-----|---------|
+| fast_flex | 0.842 | 0.918 |
+| fast_ext | 0.712 | 0.844 |
+| free_controlled | 0.768 | 0.876 |
+| microcorrections | 0.449 | 0.674 |
+| slow_flex | 0.604 | 0.779 |
+| slow_ext | 0.587 | 0.767 |
+| slow_cycles | 0.577 | 0.763 |
+| holds_intermediate | 0.101 | 0.482 |
+| **mean per-task R²** | **0.580** | — |
+
+> El val R² pooled (0.688) es mayor que la media per-task (0.580) porque
+> `holds_intermediate` (R²=0.101) pesa igual que los demás en la media pero
+> tiene muchas menos muestras que las tasks de movimiento continuo.
+
+**Evaluación online**: el modelo responde correctamente a movimientos lentos
+(punto débil de modelos anteriores) y a movimientos rápidos. Leve drift hacia
+abajo en reposo prolongado (esperado — el integrador con leak tiende a 0).
+
+#### Comando de entrenamiento
+
+```bash
+python train.py \
+  --csv data/raw/P01/P01_S02_*.csv data/raw/P01/P01_S03_*.csv \
+       data/raw/P01/P01_S08_*.csv data/raw/P01/P01_S09_*.csv \
+       data/raw/P01/P01_S10_*.csv data/raw/P01/P01_S11_*.csv \
+       data/raw/P01/P01_S12_*.csv data/raw/P01/P01_S13_*.csv \
+       data/raw/P01/P01_S14_*.csv \
+  --features rms d_rms rms_slow d_rms_slow \
+  --sigma-ms 50 --adaptive-sigma-slow-ms 80 \
+  --emg-attenuation-flx 0.4 --emg-attenuation-ext 0.4 \
+  --feature-clip 300 \
+  --hidden-channels 48 \
+  --dilations 1 3 9 27 81 162 \
+  --lr-scheduler plateau \
+  --epochs 100 \
+  --run-name tcn_s02s03s08s09s10s11s12s13s14_rawrms_RF567_h48_adapsig50_80_attn04_clip300_plateau_100ep
+```
+
+#### Modelos activos (ordenados de mejor a peor online)
+
+| Checkpoint | Sessions | attn | clip | Val R² | Notas |
+|---|---|---|---|---|---|
+| `…h48_adapsig50_80_attn04_clip300…` | S02–S14 | 0.4/0.4 | 300 | **0.688** | **Champion** |
+| `…adapsig50_80_attn04_clip200…` (S02–S14) | S02–S14 | 0.4/0.4 | 200 | — | segunda opción |
+| `…adapsig50_80_attn05_clip200…` | S02–S11 | 0.5/0.5 | 200 | — | |
+| `…adapsig50_80_attn_flx04_ext035…` | S02–S12 | 0.4/0.35 | 200 | — | |
+| `…adapsig50_80_attn04_clip200…` (S02–S11) | S02–S11 | 0.4/0.4 | 200 | — | baseline de comparación |
+
 ---
 
 ## 11. Visualización (offline replay y plan online)
@@ -1549,9 +1693,22 @@ python collect.py -s P01 -n 1 -p P01-A --notes "mcu=arduino_uno"
 # Dry-run del stream serial (validar hardware antes)
 python check_serial.py
 
-# Training (default: split estratificado, sin WN para MPS)
-python train.py --csv data/raw/P01/P01_S01_20260524_181522.csv \
-                --epochs 20 --run-name tcn_s01_strat --no-weight-norm
+# Training — champion (h48, S02–S14, adaptive sigma, attn=0.4, clip=300)
+python train.py \
+  --csv data/raw/P01/P01_S02_*.csv data/raw/P01/P01_S03_*.csv \
+       data/raw/P01/P01_S08_*.csv data/raw/P01/P01_S09_*.csv \
+       data/raw/P01/P01_S10_*.csv data/raw/P01/P01_S11_*.csv \
+       data/raw/P01/P01_S12_*.csv data/raw/P01/P01_S13_*.csv \
+       data/raw/P01/P01_S14_*.csv \
+  --features rms d_rms rms_slow d_rms_slow \
+  --sigma-ms 50 --adaptive-sigma-slow-ms 80 \
+  --emg-attenuation-flx 0.4 --emg-attenuation-ext 0.4 \
+  --feature-clip 300 \
+  --hidden-channels 48 \
+  --dilations 1 3 9 27 81 162 \
+  --lr-scheduler plateau \
+  --epochs 100 \
+  --run-name tcn_s02s03s08s09s10s11s12s13s14_rawrms_RF567_h48_adapsig50_80_attn04_clip300_plateau_100ep
 
 # Análisis por task de un checkpoint
 python analyze.py --checkpoint checkpoints/<run>/best.pt \
@@ -1559,7 +1716,8 @@ python analyze.py --checkpoint checkpoints/<run>/best.pt \
 
 # Replay gráfico (offline)
 python visualize.py --checkpoint checkpoints/<run>/best.pt \
-                    --csv data/raw/<subject>/<session>.csv
+                    --csv data/raw/<subject>/<session>.csv \
+                    --port /dev/cu.usbserial-2110 --baud 1000000
 
 # Test del modelo standalone (forward + causalidad)
 python models/tcn.py
